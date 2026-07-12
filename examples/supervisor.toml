@@ -1,0 +1,16 @@
+# Example supervisor-rs config (shape is finalised in Этап 1; illustrative for now).
+#
+# Each [[process]] entry describes one supervised process. `command` is an argv
+# array (no shell parsing). `restart` is one of: always | on-failure | never.
+
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "sleep", "3600"]
+restart = "on-failure"
+
+[[process]]
+name = "worker"
+command = ["/usr/bin/env", "sleep", "3600"]
+# workdir = "/srv/worker"
+# env = { RUST_LOG = "info" }
+restart = "always"
