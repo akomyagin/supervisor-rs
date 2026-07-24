@@ -1,26 +1,83 @@
-//! Process spawning, monitoring, and teardown for supervisor-rs.
+//! Process spawning for supervisor-rs.
 //!
-//! This is the heart of the supervisor and the module with the trickiest POSIX
-//! mechanics. It is a skeleton in Этап 0; the real logic lands across Этапы 1–4.
-//!
-//! Design intent (the hard part, spelled out so it is not "discovered" late):
-//! each supervised process is launched in its **own process group** via
-//! `setsid`/`pre_exec(setpgid)`, so that when it forks children of its own, the
-//! supervisor can signal the entire group with `killpg` rather than just the
-//! direct child. Shutdown is SIGTERM to the group → grace timeout → SIGKILL to
-//! the group. Exited children must be reaped (`waitpid`) so they do not linger
-//! as zombies.
+//! Этап 1: plain spawn from a `ProcessConfig` (argv, optional workdir, env
+//! additions), no restart or teardown yet. Later stages add the monitor loop
+//! (Этап 2), signal forwarding (Этап 3) and process-group teardown (Этап 4).
 
-// TODO(Этап 1): define a `Child` handle (pid, name, config index, spawned-at)
-//               and `pub fn spawn(cfg: &ProcessConfig) -> Result<Child, _>` using
-//               `std::process::Command` for a plain spawn (no restart yet).
-// TODO(Этап 2): add the monitor loop — reap exited children via waitpid, and
-//               decide whether to restart based on RestartPolicy + exit status,
-//               applying exponential backoff between restart attempts.
-// TODO(Этап 3): install SIGTERM/SIGINT handlers (self-pipe or signalfd) and
-//               forward the received signal to the supervised child.
-// TODO(Этап 4): place each child in its own process group
-//               (`Command::pre_exec` → `setsid`/`setpgid`) and implement
-//               `terminate_tree(pgid, grace)`: `killpg(SIGTERM)` → wait up to
-//               `grace` → `killpg(SIGKILL)`, then reap. This is the process-tree
-//               teardown the whole project exists to get right.
+use crate::config::ProcessConfig;
+use std::process::{Child, Command};
+
+#[derive(Debug)]
+pub enum SpawnError {
+    EmptyCommand {
+        name: String,
+    },
+    Spawn {
+        name: String,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::EmptyCommand { name } => {
+                write!(f, "process '{name}': command is empty")
+            }
+            SpawnError::Spawn { name, source } => {
+                write!(f, "process '{name}': failed to spawn: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SpawnError::EmptyCommand { .. } => None,
+            SpawnError::Spawn { source, .. } => Some(source),
+        }
+    }
+}
+
+pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
+    if cfg.command.is_empty() {
+        return Err(SpawnError::EmptyCommand {
+            name: cfg.name.clone(),
+        });
+    }
+
+    let mut cmd = Command::new(&cfg.command[0]);
+    cmd.args(&cfg.command[1..]);
+    if let Some(dir) = &cfg.workdir {
+        cmd.current_dir(dir);
+    }
+    if let Some(map) = &cfg.env {
+        // Adds to the inherited environment; deliberately no env_clear.
+        cmd.envs(map);
+    }
+
+    // TODO(Этап 4): put child in its own process group via pre_exec(setsid) — see SKILL.md
+    cmd.spawn().map_err(|source| SpawnError::Spawn {
+        name: cfg.name.clone(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_rejects_empty_command() {
+        let cfg = ProcessConfig {
+            name: "empty".to_string(),
+            command: Vec::new(),
+            workdir: None,
+            env: None,
+            restart: String::new(),
+        };
+        let err = spawn(&cfg).unwrap_err();
+        assert!(matches!(err, SpawnError::EmptyCommand { .. }));
+    }
+}
