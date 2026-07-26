@@ -58,6 +58,7 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
     }
 
     // TODO(Этап 4): put child in its own process group via pre_exec(setsid) — see SKILL.md
+    // TODO(Этап 4): switch reaping to nix::waitpid(WNOHANG) instead of try_wait.
     cmd.spawn().map_err(|source| SpawnError::Spawn {
         name: cfg.name.clone(),
         source,
@@ -67,6 +68,7 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RestartPolicy;
 
     #[test]
     fn spawn_rejects_empty_command() {
@@ -75,7 +77,7 @@ mod tests {
             command: Vec::new(),
             workdir: None,
             env: None,
-            restart: String::new(),
+            restart: RestartPolicy::default(),
         };
         let err = spawn(&cfg).unwrap_err();
         assert!(matches!(err, SpawnError::EmptyCommand { .. }));

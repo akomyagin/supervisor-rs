@@ -16,6 +16,7 @@ fn exits_success_when_all_processes_start_and_exit_cleanly() {
         [[process]]
         name = "ok"
         command = ["/usr/bin/env", "true"]
+        restart = "never"
         "#
     )
     .unwrap();
@@ -33,10 +34,12 @@ fn exits_failure_when_a_process_fails_to_spawn() {
         [[process]]
         name = "ok"
         command = ["/usr/bin/env", "true"]
+        restart = "never"
 
         [[process]]
         name = "missing"
         command = ["/no/such/binary-xyz"]
+        restart = "never"
         "#
     )
     .unwrap();

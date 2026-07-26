@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use supervisor_rs::config::ProcessConfig;
+use supervisor_rs::config::{ProcessConfig, RestartPolicy};
 use supervisor_rs::process;
 
 fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
@@ -12,7 +12,7 @@ fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
         command: command.iter().map(|s| s.to_string()).collect(),
         workdir: None,
         env: None,
-        restart: String::new(),
+        restart: RestartPolicy::Never,
     }
 }
 
