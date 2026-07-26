@@ -25,12 +25,19 @@ Docker Compose в проекте **сознательно отсутствует
 ```
 src/
 ├── main.rs      # инициализация логов, разбор CLI, запуск supervise loop
+├── lib.rs       # библиотечный крейт: реэкспорт модулей для бинарника и тестов
 ├── config.rs    # ProcessConfig, RestartPolicy, load() — парсинг TOML
-└── process.rs   # spawn / monitor / restart / teardown, process groups, waitpid
+├── clock.rs     # Clock / SystemClock / FakeClock — инъекция времени
+├── supervise.rs # SupervisorLoop: monitor-loop, restart policy, backoff
+└── process.rs   # spawn / teardown, process groups, waitpid
 ```
 
 Логика намеренно разделена: `config` — чистый парсинг без сайд-эффектов (легко
-юнит-тестировать), `process` — вся POSIX-механика.
+юнит-тестировать), `process` — POSIX-механика запуска и (с Этапа 4) teardown,
+`supervise` — оркестрация поверх них. Библиотечный крейт (`lib.rs`) появился в
+Этапе 1, чтобы интеграционные тесты в `tests/` видели публичный API: тесты не
+могут импортировать модули из бинарного крейта. `clock.rs` вынесен отдельно,
+потому что от инъекции времени зависит детерминизм тестов backoff.
 
 ## Разбивка по Этапам
 
@@ -42,7 +49,7 @@ src/
 - Документация (`PLAN`, `TECHNICAL_PLAN`, `POST_MVP_PLAN`, `README`, `CLAUDE.md`).
 - **Критерий приёмки:** `cargo check` и `cargo build` проходят чисто.
 
-### Этап 1 — Конфиг-парсинг + базовый spawn
+### Этап 1 — Конфиг-парсинг + базовый spawn (готово)
 
 - В `config.rs`: `Config { process: Vec<ProcessConfig> }` и
   `ProcessConfig { name, command: Vec<String>, workdir: Option<PathBuf>,
@@ -61,17 +68,31 @@ src/
   subcommands — Этап 5) стартует перечисленные процессы и завершается, когда они
   все вышли.
 
-### Этап 2 — Restart policy + backoff
+### Этап 2 — Restart policy + backoff (готово)
 
-- `RestartPolicy { Always, OnFailure, Never }` с serde-rename в kebab-case.
-- Monitor-loop: неблокирующий `waitpid(WNOHANG)` по всем детям, **реапинг
-  зомби**; при выходе процесса — решение о рестарте по policy и коду выхода
-  (`OnFailure` → рестарт только при ненулевом коде/сигнале).
-- Экспоненциальный backoff между рестартами (initial/max delay, factor) с
-  «сбросом» после стабильной работы N секунд, чтобы crash-loop не молотил CPU.
+- `RestartPolicy { Always, OnFailure, Never }` с serde-rename в kebab-case
+  (`config.rs`), дефолт — `on-failure`.
+- Monitor-loop (`supervise.rs`, `SupervisorLoop<C: Clock>`): неблокирующий
+  опрос всех детей + **реапинг зомби**; при выходе процесса — решение о
+  рестарте по policy и коду выхода (`OnFailure` → рестарт только при
+  ненулевом коде/сигнале).
+  **Отклонение от изначального плана (осознанное):** опрос сделан через
+  `std::process::Child::try_wait()`, а не через `waitpid(WNOHANG)` из `nix`.
+  Причина — `Child` реапит своего потомка сам, и ручной `waitpid` по тому же
+  pid дал бы двойной реапинг. Переход на `nix::sys::wait::waitpid` запланирован
+  на Этап 4, где появляются process-группы и реапить нужно по всей группе;
+  точка перехода помечена `TODO(Этап 4)` в `process.rs`.
+- Экспоненциальный backoff между рестартами: initial 1s, factor 2, max 30s,
+  сброс после 10s стабильной работы, чтобы crash-loop не молотил CPU.
+  Ошибка повторного spawn тоже уходит в backoff, а не ретраится каждый тик.
+- Стартовый spawn — best-effort: процесс, который не удалось запустить,
+  логируется и пропускается, остальные супервизируются (аборт всего старта
+  оставлял бы уже поднятых детей осиротевшими). Ошибки старта отражаются в
+  exit-коде.
 - **Тесты:** заглушка, падающая с заданным кодом; проверка, что `never` не
   рестартит, `always` рестартит всегда, `on-failure` — только при провале;
-  проверка нарастания задержки backoff (с инъекцией «часов» для детерминизма).
+  проверка нарастания задержки backoff — через инъекцию «часов»
+  (`clock.rs`: `Clock` / `SystemClock` / `FakeClock`), без реальных sleep.
 - **Критерий приёмки:** падающий процесс с `on-failure` перезапускается с
   растущей задержкой; с `never` — нет.
 

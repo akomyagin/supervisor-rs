@@ -29,10 +29,34 @@ pub struct ProcessConfig {
     pub workdir: Option<PathBuf>,
     #[serde(default)]
     pub env: Option<BTreeMap<String, String>>,
-    // TODO(Этап 2): replace with a `RestartPolicy` enum (always | on-failure |
-    // never) without breaking the TOML format.
     #[serde(default)]
-    pub restart: String,
+    pub restart: RestartPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    Always,
+    #[default]
+    OnFailure,
+    Never,
+}
+
+/// How a supervised process finished, as seen by the restart policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitOutcome {
+    Success,
+    Failure,
+}
+
+impl RestartPolicy {
+    pub fn should_restart(self, outcome: ExitOutcome) -> bool {
+        match self {
+            RestartPolicy::Always => true,
+            RestartPolicy::Never => false,
+            RestartPolicy::OnFailure => outcome == ExitOutcome::Failure,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -118,8 +142,8 @@ mod tests {
             config.process[0].command,
             vec!["/usr/bin/env", "sleep", "3600"]
         );
-        assert_eq!(config.process[0].restart, "on-failure");
-        assert_eq!(config.process[1].restart, "always");
+        assert_eq!(config.process[0].restart, RestartPolicy::OnFailure);
+        assert_eq!(config.process[1].restart, RestartPolicy::Always);
     }
 
     #[test]
@@ -149,7 +173,42 @@ mod tests {
         let proc = &config.process[0];
         assert!(proc.workdir.is_none());
         assert!(proc.env.is_none());
-        assert_eq!(proc.restart, "");
+        assert_eq!(proc.restart, RestartPolicy::OnFailure);
+    }
+
+    #[test]
+    fn parses_restart_never() {
+        let toml_src = r#"
+            [[process]]
+            name = "oneshot"
+            command = ["/usr/bin/env", "true"]
+            restart = "never"
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.process[0].restart, RestartPolicy::Never);
+    }
+
+    #[test]
+    fn rejects_unknown_restart_policy() {
+        let toml_src = r#"
+            [[process]]
+            name = "bad"
+            command = ["/usr/bin/env", "true"]
+            restart = "sometimes"
+        "#;
+        let result = toml::from_str::<Config>(toml_src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_restart_follows_policy_and_outcome() {
+        use ExitOutcome::{Failure, Success};
+        assert!(RestartPolicy::Always.should_restart(Success));
+        assert!(RestartPolicy::Always.should_restart(Failure));
+        assert!(!RestartPolicy::Never.should_restart(Success));
+        assert!(!RestartPolicy::Never.should_restart(Failure));
+        assert!(!RestartPolicy::OnFailure.should_restart(Success));
+        assert!(RestartPolicy::OnFailure.should_restart(Failure));
     }
 
     #[test]
