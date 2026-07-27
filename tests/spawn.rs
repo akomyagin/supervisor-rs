@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use supervisor_rs::config::{ProcessConfig, RestartPolicy};
+use supervisor_rs::config::{ProcessConfig, RestartPolicy, DEFAULT_STOP_GRACE_SECS};
 use supervisor_rs::process;
 
 fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
@@ -13,6 +13,7 @@ fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
         workdir: None,
         env: None,
         restart: RestartPolicy::Never,
+        stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
     }
 }
 

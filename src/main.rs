@@ -1,11 +1,13 @@
 //! supervisor-rs — a minimal process supervisor (mini-systemd) for Unix.
 //!
-//! Этап 3: loads a TOML config given as the single CLI argument, spawns each
-//! configured process and supervises them — applying the per-process restart
-//! policy (always / on-failure / never) with exponential backoff — until a
-//! SIGTERM/SIGINT arrives, which is forwarded to every child for a graceful
-//! shutdown. Process-group teardown (SIGTERM → timeout → SIGKILL) lands in
-//! Этап 4 — see `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
+//! Этап 4: loads a TOML config given as the single CLI argument, spawns each
+//! configured process as the leader of its own process group and supervises
+//! them — applying the per-process restart policy (always / on-failure /
+//! never) with exponential backoff — until a SIGTERM/SIGINT arrives. That
+//! signal is forwarded to each process *group*, so the whole tree a child
+//! forked goes down with it; a group that outlives its `stop-grace-secs` is
+//! SIGKILLed, as is one whose leader exits leaving stragglers behind. See
+//! `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -30,8 +32,6 @@ fn main() -> ExitCode {
         "supervisor-rs starting"
     );
 
-    // TODO(Этап 4): put each child in its own process group and tear the whole
-    //               tree down with SIGTERM → timeout → SIGKILL.
     // TODO(Этап 5): expose a status/control CLI subcommand.
 
     let args: Vec<String> = std::env::args().skip(1).collect();

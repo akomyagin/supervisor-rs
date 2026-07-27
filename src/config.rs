@@ -15,6 +15,10 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Default grace period between the shutdown signal and SIGKILL, seconds.
+pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -31,6 +35,24 @@ pub struct ProcessConfig {
     pub env: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Seconds between the shutdown signal sent to the process group and the
+    /// SIGKILL escalation. Whole seconds by design: a TOML integer needs no
+    /// duration parser, and negative values are rejected by `u64` itself. The
+    /// key is kebab-case to match the `on-failure` style of `restart`; the
+    /// older single-word keys keep their names, hence a per-field rename
+    /// rather than `rename_all` on the struct.
+    #[serde(rename = "stop-grace-secs", default = "default_stop_grace_secs")]
+    pub stop_grace_secs: u64,
+}
+
+fn default_stop_grace_secs() -> u64 {
+    DEFAULT_STOP_GRACE_SECS
+}
+
+impl ProcessConfig {
+    pub fn stop_grace(&self) -> Duration {
+        Duration::from_secs(self.stop_grace_secs)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -186,6 +208,61 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(config.process[0].restart, RestartPolicy::Never);
+    }
+
+    #[test]
+    fn stop_grace_defaults_to_five_secs() {
+        let toml_src = r#"
+            [[process]]
+            name = "bare"
+            command = ["/usr/bin/env", "true"]
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.process[0].stop_grace_secs, DEFAULT_STOP_GRACE_SECS);
+        assert_eq!(config.process[0].stop_grace(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parses_stop_grace_secs() {
+        let toml_src = r#"
+            [[process]]
+            name = "slow"
+            command = ["/usr/bin/env", "true"]
+            stop-grace-secs = 10
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.process[0].stop_grace_secs, 10);
+        assert_eq!(config.process[0].stop_grace(), Duration::from_secs(10));
+    }
+
+    /// A negative grace is rejected for free by the `u64` field type — no
+    /// hand-written validation, which is half the reason the field is integer
+    /// seconds rather than a float or a duration string.
+    #[test]
+    fn rejects_negative_stop_grace() {
+        let toml_src = r#"
+            [[process]]
+            name = "bad"
+            command = ["/usr/bin/env", "true"]
+            stop-grace-secs = -1
+        "#;
+        assert!(toml::from_str::<Config>(toml_src).is_err());
+    }
+
+    /// Pins the kebab-case spelling as the contract. The parser does not deny
+    /// unknown keys, so a snake_case misspelling is silently ignored and the
+    /// default applies — asserting the default is exactly what detects a future
+    /// accidental rename of the accepted key.
+    #[test]
+    fn rejects_snake_case_stop_grace() {
+        let toml_src = r#"
+            [[process]]
+            name = "typo"
+            command = ["/usr/bin/env", "true"]
+            stop_grace_secs = 10
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.process[0].stop_grace_secs, DEFAULT_STOP_GRACE_SECS);
     }
 
     #[test]

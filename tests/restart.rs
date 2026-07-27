@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use supervisor_rs::clock::FakeClock;
-use supervisor_rs::config::{ProcessConfig, RestartPolicy};
+use supervisor_rs::config::{ProcessConfig, RestartPolicy, DEFAULT_STOP_GRACE_SECS};
 use supervisor_rs::supervise::{SupervisorLoop, STABLE_RESET};
 
 fn cfg(name: &str, command: &[&str], restart: RestartPolicy) -> ProcessConfig {
@@ -20,6 +20,7 @@ fn cfg(name: &str, command: &[&str], restart: RestartPolicy) -> ProcessConfig {
         workdir: None,
         env: None,
         restart,
+        stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
     }
 }
 
