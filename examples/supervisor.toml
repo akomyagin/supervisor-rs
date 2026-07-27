@@ -2,11 +2,25 @@
 #
 # Each [[process]] entry describes one supervised process. `command` is an argv
 # array (no shell parsing). `restart` is one of: always | on-failure | never.
+#
+# Every process is started as the leader of its own process group, so shutting
+# the supervisor down takes the whole tree of its descendants with it, not just
+# the direct child.
 
 [[process]]
 name = "web"
 command = ["/usr/bin/env", "sleep", "3600"]
 restart = "on-failure"
+# Seconds to wait after SIGTERM/SIGINT before the group is SIGKILLed. Default 5.
+#
+# The grace protects the *leader* only. Once the leader exits, whatever is left
+# in its group is killed at once — so a wrapper that does not wait for its own
+# children hands them no grace at all. In particular, prefer
+#   ["/bin/sh", "-c", "exec myapp"]
+# over ["/bin/sh", "-c", "myapp"]: without `exec` the shell is the leader, it
+# dies instantly on SIGTERM, and myapp is SIGKILLed milliseconds later having
+# never had a chance to shut down cleanly.
+stop-grace-secs = 10
 
 [[process]]
 name = "worker"
