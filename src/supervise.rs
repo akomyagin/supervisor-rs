@@ -1,9 +1,16 @@
 //! Supervision loop (Этап 2): watches spawned processes, applies the restart
 //! policy on exit and respawns with exponential backoff.
+//!
+//! Этап 3 adds a shutdown mode: a SIGTERM/SIGINT caught by the process-wide
+//! handler is forwarded to every child, and from that point on the restart
+//! policy is suppressed — otherwise the forwarded signal would kill a child,
+//! `tick()` would see the exit and an `always`/`on-failure` policy would
+//! respawn it, and the supervisor would never terminate.
 
 use crate::clock::Clock;
 use crate::config::{ExitOutcome, ProcessConfig};
 use crate::process;
+use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -65,6 +72,11 @@ pub struct SupervisorLoop<'a, C: Clock> {
     procs: Vec<Supervised<'a>>,
     clock: C,
     had_start_errors: bool,
+    /// Set once a shutdown signal has been received; suppresses restarts.
+    /// Deliberately per-instance state rather than a global: tests can drive
+    /// `begin_shutdown()` directly without touching process-wide signal state.
+    shutting_down: bool,
+    shutdown_signal: Option<Signal>,
 }
 
 impl<'a, C: Clock> SupervisorLoop<'a, C> {
@@ -102,12 +114,50 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             procs,
             clock,
             had_start_errors,
+            shutting_down: false,
+            shutdown_signal: None,
         }
     }
 
     /// Whether any process failed to spawn during startup.
     pub fn had_start_errors(&self) -> bool {
         self.had_start_errors
+    }
+
+    /// Enters shutdown mode: cancels pending restarts and forwards `sig` to
+    /// every live child. Idempotent — a repeated signal is a no-op, so the
+    /// first signal keeps ownership of the shutdown.
+    pub fn begin_shutdown(&mut self, sig: Signal) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.shutdown_signal = Some(sig);
+        tracing::info!(signal = ?sig, "shutdown requested, forwarding to children");
+
+        for proc in &mut self.procs {
+            // Drop any scheduled restart: a process waiting out its backoff
+            // must not come back to life during shutdown.
+            proc.next_restart_at = None;
+            match proc.child.as_ref() {
+                Some(child) => {
+                    if let Err(err) = process::forward_signal(child, sig) {
+                        // A failed forward must not abort the shutdown of the
+                        // remaining processes; log and move on.
+                        tracing::error!(
+                            name = %proc.config.name,
+                            error = %err,
+                            "failed to forward signal to process"
+                        );
+                    }
+                    // `done` stays false on purpose: the child is still alive
+                    // and must be reaped by tick() before the loop may exit,
+                    // otherwise we would leave it orphaned.
+                }
+                // Nothing left to wait for: no live child and no restart.
+                None => proc.done = true,
+            }
+        }
     }
 
     pub fn tick(&mut self) {
@@ -123,7 +173,16 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                             "process exited"
                         );
                         proc.child = None;
-                        if proc.config.restart.should_restart(outcome) {
+                        if self.shutting_down {
+                            // During shutdown the exit is the expected result
+                            // of our own forwarded signal — the restart policy
+                            // is not consulted at all.
+                            proc.done = true;
+                            tracing::info!(
+                                name = %proc.config.name,
+                                "process exited during shutdown"
+                            );
+                        } else if proc.config.restart.should_restart(outcome) {
                             if self.clock.now().saturating_duration_since(proc.started_at)
                                 >= STABLE_RESET
                             {
@@ -150,6 +209,10 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                     }
                 }
             } else if !proc.done
+                // Defense in depth: begin_shutdown() already cleared every
+                // next_restart_at, but a respawn here would resurrect a
+                // process we are trying to stop.
+                && !self.shutting_down
                 && proc
                     .next_restart_at
                     .is_some_and(|at| self.clock.now() >= at)
@@ -190,7 +253,28 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
     }
 
     pub fn run(&mut self) {
-        while self.any_active() {
+        loop {
+            // Polled before the liveness check so that a signal delivered
+            // while `new()` was still spawning is acted on in the very first
+            // iteration, instead of after a full tick.
+            if let Some(sig) = crate::signal::take_pending() {
+                if !self.shutting_down {
+                    self.begin_shutdown(sig);
+                } else {
+                    // Logged at info, not debug: until Этап 4 adds escalation a
+                    // child ignoring SIGTERM hangs the shutdown forever, and an
+                    // operator pressing Ctrl-C again deserves to be told that
+                    // SIGKILL is currently the only way out.
+                    tracing::info!(
+                        signal = ?sig,
+                        "already shutting down; send SIGKILL to force an exit"
+                    );
+                    // TODO(Этап 4): a second signal should escalate to SIGKILL.
+                }
+            }
+            if !self.any_active() {
+                break;
+            }
             self.tick();
             self.clock.sleep(TICK);
         }
@@ -216,6 +300,15 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
         self.procs[index]
             .next_restart_at
             .map(|at| at.saturating_duration_since(self.clock.now()))
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down
+    }
+
+    /// The signal that started the shutdown, if any.
+    pub fn shutdown_signal(&self) -> Option<Signal> {
+        self.shutdown_signal
     }
 }
 

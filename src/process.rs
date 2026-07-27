@@ -1,10 +1,12 @@
 //! Process spawning for supervisor-rs.
 //!
-//! Этап 1: plain spawn from a `ProcessConfig` (argv, optional workdir, env
-//! additions), no restart or teardown yet. Later stages add the monitor loop
-//! (Этап 2), signal forwarding (Этап 3) and process-group teardown (Этап 4).
+//! Spawn (Этап 1) and signal forwarding (Этап 3) for supervised processes.
+//! Process-group teardown lands in Этап 4.
 
 use crate::config::ProcessConfig;
+use nix::errno::Errno;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use std::process::{Child, Command};
 
 #[derive(Debug)]
@@ -63,6 +65,23 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
         name: cfg.name.clone(),
         source,
     })
+}
+
+/// Forwards `sig` to the child process.
+///
+/// Call only for a `Child` that has not been reaped yet: after reaping, the
+/// OS may reuse the pid for an unrelated process and the signal would hit it.
+// TODO(Этап 4): switch to killpg(pgid, sig) once children get their own process group.
+pub fn forward_signal(child: &Child, sig: Signal) -> Result<(), Errno> {
+    match kill(Pid::from_raw(child.id() as i32), sig) {
+        Err(Errno::ESRCH) => {
+            // The child already died but has not been reaped yet — nothing to
+            // deliver to, which is fine during shutdown.
+            tracing::debug!(pid = child.id(), signal = ?sig, "signal target already gone");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
