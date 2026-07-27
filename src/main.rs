@@ -1,16 +1,18 @@
 //! supervisor-rs — a minimal process supervisor (mini-systemd) for Unix.
 //!
-//! Этап 2: loads a TOML config given as the single CLI argument, spawns each
+//! Этап 3: loads a TOML config given as the single CLI argument, spawns each
 //! configured process and supervises them — applying the per-process restart
-//! policy (always / on-failure / never) with exponential backoff. Signal
-//! handling and process-group teardown land in later stages — see
-//! `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
+//! policy (always / on-failure / never) with exponential backoff — until a
+//! SIGTERM/SIGINT arrives, which is forwarded to every child for a graceful
+//! shutdown. Process-group teardown (SIGTERM → timeout → SIGKILL) lands in
+//! Этап 4 — see `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use supervisor_rs::clock::SystemClock;
 use supervisor_rs::config;
+use supervisor_rs::signal;
 use supervisor_rs::supervise::SupervisorLoop;
 
 fn main() -> ExitCode {
@@ -28,7 +30,6 @@ fn main() -> ExitCode {
         "supervisor-rs starting"
     );
 
-    // TODO(Этап 3): install signal handlers and forward SIGTERM/SIGINT to children.
     // TODO(Этап 4): put each child in its own process group and tear the whole
     //               tree down with SIGTERM → timeout → SIGKILL.
     // TODO(Этап 5): expose a status/control CLI subcommand.
@@ -48,6 +49,15 @@ fn main() -> ExitCode {
         }
     };
 
+    // Handlers go up *before* the first child is spawned: a signal arriving in
+    // the window between a successful spawn and handler installation would
+    // kill the supervisor by the default disposition and leave the children
+    // it had already started orphaned.
+    if let Err(err) = signal::install_handlers() {
+        tracing::error!(error = %err, "failed to install signal handlers");
+        return ExitCode::FAILURE;
+    }
+
     // A spawn failure means not everything ran as configured — reflect that in
     // the exit code rather than reporting a misleading SUCCESS, even though
     // processes that did spawn are still supervised below.
@@ -55,6 +65,13 @@ fn main() -> ExitCode {
     let had_start_errors = loop_.had_start_errors();
     loop_.run();
 
+    // A shutdown requested by a signal is a normal way to stop a daemon (as it
+    // is for a systemd unit), not a failure, so it does not affect the exit
+    // code: usage → 2, bad config → 1, start errors → 1, otherwise 0. The
+    // shell convention 128+signo is deliberately not used: it means "the
+    // process was *killed* by a signal", which would only be honest if we
+    // re-raised the signal on ourselves — and that would override the
+    // had_start_errors code.
     if had_start_errors {
         ExitCode::FAILURE
     } else {
