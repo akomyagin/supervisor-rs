@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use nix::unistd::{getpgid, Pid};
 use supervisor_rs::clock::FakeClock;
 use supervisor_rs::config::{ProcessConfig, RestartPolicy, DEFAULT_STOP_GRACE_SECS};
 use supervisor_rs::supervise::SupervisorLoop;
@@ -66,6 +66,20 @@ echo $! >> "$SUP_PIDFILE"
 exit 1
 "#;
 
+/// A stub that fails on its first run and stays alive on the second, telling
+/// the two apart by the number of lines already in the pid file.
+///
+/// The asymmetry is what makes the restarted instance observable: a stub that
+/// exited immediately on the respawn too would be reaped by the very next
+/// `tick()`, and `getpgid` on the restarted pid would race that reaping.
+const RESTART_SCRIPT: &str = r#"echo $$ >> "$SUP_PIDFILE"
+if [ "$(wc -l < "$SUP_PIDFILE")" -ge 2 ]; then
+  i=0
+  while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+fi
+exit 1
+"#;
+
 fn sh_with_pidfile(
     script: &str,
     restart: RestartPolicy,
@@ -81,22 +95,31 @@ fn sh_with_pidfile(
     config
 }
 
-/// Waits until the stub's pid file holds a complete, parseable pid.
+/// Waits until line `n` (1-based) of the stub's pid file holds a complete,
+/// parseable pid, and returns it.
 ///
 /// Polling for mere existence would not do: `echo $$ >> file` is an `open`
 /// followed by a separate `write`, so between the two the file exists and is
-/// empty. Waiting for the content closes that window.
-fn wait_for_pid(path: &Path, timeout: Duration) -> i32 {
+/// empty. Waiting for the content closes that window — and for line `n` the
+/// same argument applies to the line itself, which is why the *n*-th line must
+/// parse, not merely exist.
+fn wait_for_pid_line(path: &Path, n: usize, timeout: Duration) -> i32 {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(text) = std::fs::read_to_string(path) {
-            if let Some(pid) = text.lines().next().and_then(|l| l.trim().parse().ok()) {
+            if let Some(pid) = text.lines().nth(n - 1).and_then(|l| l.trim().parse().ok()) {
                 return pid;
             }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("stub did not report its pid within {timeout:?}");
+    panic!("stub did not report pid line {n} within {timeout:?}");
+}
+
+/// The common case of [`wait_for_pid_line`]: the stub's first (and usually
+/// only) report.
+fn wait_for_pid(path: &Path, timeout: Duration) -> i32 {
+    wait_for_pid_line(path, 1, timeout)
 }
 
 fn is_alive(pid: i32) -> bool {
@@ -328,4 +351,113 @@ fn leader_exit_sweeps_leftover_grandchildren() {
     // Nobody reaps the grandchild but init, so its disappearance is
     // asynchronous — poll rather than assert once.
     wait_until_gone(grandchild, Duration::from_secs(5));
+}
+
+/// Every process gets its *own* grace deadline, and the deadlines run
+/// concurrently.
+///
+/// This is the argument against the rejected blocking `terminate_tree(pgid,
+/// grace)` — it would have serialised the waits into 2 + 7 = 9 s — and until
+/// now no test exercised it: every other shutdown test supervises a single
+/// process, so a regression collapsing the per-process deadlines into one
+/// shared deadline would have stayed green.
+///
+/// Both stubs are deaf to SIGTERM, so the only thing that can kill either of
+/// them is its own expired deadline; the fake clock is advanced to 3 s, which
+/// is past the first grace (2 s) and short of the second (7 s).
+#[test]
+fn shutdown_deadlines_are_per_process_not_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    let quick_pidfile = dir.path().join("quick-pids");
+    let slow_pidfile = dir.path().join("slow-pids");
+    let configs = [
+        sh_with_pidfile(DEAF_SCRIPT, RestartPolicy::Never, &quick_pidfile, 2),
+        sh_with_pidfile(DEAF_SCRIPT, RestartPolicy::Never, &slow_pidfile, 7),
+    ];
+    let mut loop_ = SupervisorLoop::new(&configs, FakeClock::new(Instant::now()));
+
+    let quick_pid = wait_for_pid(&quick_pidfile, Duration::from_secs(5));
+    let slow_pid = wait_for_pid(&slow_pidfile, Duration::from_secs(5));
+    loop_.tick();
+    loop_.begin_shutdown(Signal::SIGTERM);
+
+    // 3 s of logical time: past the first grace, well short of the second.
+    loop_.clock().advance(Duration::from_secs(3));
+    tick_until_done(&mut loop_, 0);
+    // A direct child reaped by the loop leaves no zombie, so ESRCH is immediate.
+    assert!(
+        !is_alive(quick_pid),
+        "the 2 s grace did not expire on its own schedule"
+    );
+    assert!(
+        !loop_.is_done(1),
+        "the second process finished on the first one's deadline"
+    );
+    assert!(
+        is_alive(slow_pid),
+        "the 7 s grace was cut short by the other process's deadline"
+    );
+
+    // Total 8 s: now the second deadline is past too.
+    loop_.clock().advance(Duration::from_secs(5));
+    tick_until_done(&mut loop_, 1);
+    assert!(
+        !is_alive(slow_pid),
+        "the second process survived its own deadline"
+    );
+}
+
+/// A restarted instance leads a *fresh* group of its own.
+///
+/// `leader_exit_sweeps_leftover_grandchildren` stops at "a restart is
+/// scheduled"; nothing checked that the new instance actually comes up and gets
+/// its own pgid. That matters because the whole teardown rests on
+/// `pgid == leader pid`: a respawn that forgot `setsid` — or one whose pgid was
+/// carried over from the reaped predecessor — would make the next `killpg` miss
+/// its tree, or hit somebody else's.
+#[test]
+fn restarted_instance_leads_its_own_fresh_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pids");
+    let configs = [sh_with_pidfile(
+        RESTART_SCRIPT,
+        RestartPolicy::OnFailure,
+        &pidfile,
+        DEFAULT_STOP_GRACE_SECS,
+    )];
+    let mut loop_ = SupervisorLoop::new(&configs, FakeClock::new(Instant::now()));
+
+    let first_pid = wait_for_pid_line(&pidfile, 1, Duration::from_secs(5));
+    tick_until_restart_scheduled(&mut loop_, 0);
+
+    // Skip the backoff on the fake clock, then let one tick do the respawn.
+    let delay = loop_.next_restart_delay(0).unwrap();
+    loop_.clock().advance(delay);
+    loop_.tick();
+    assert_eq!(loop_.restart_count(0), 1, "the process was not restarted");
+
+    let second_pid = wait_for_pid_line(&pidfile, 2, Duration::from_secs(5));
+    assert_ne!(
+        first_pid, second_pid,
+        "the restarted instance reported the old pid"
+    );
+
+    // setsid runs in the child after fork, so the group membership is not
+    // guaranteed to be visible the instant the pid shows up — poll with a
+    // deadline instead of asserting once.
+    let target = Pid::from_raw(second_pid);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pgid = getpgid(Some(target)).unwrap();
+    while pgid != target && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        pgid = getpgid(Some(target)).unwrap();
+    }
+    assert_eq!(
+        pgid, target,
+        "the restarted instance did not lead its own group"
+    );
+
+    loop_.begin_shutdown(Signal::SIGTERM);
+    loop_.escalate_to_kill();
+    tick_until_done(&mut loop_, 0);
 }

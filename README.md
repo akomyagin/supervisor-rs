@@ -14,11 +14,12 @@ policy (`always` / `on-failure` / `never`), а при собственном з�
 
 ## Статус
 
-Готовы Этапы 0–4: парсинг TOML-конфига, запуск процессов и супервизия с
+Готовы Этапы 0–5: парсинг TOML-конфига, запуск процессов и супервизия с
 restart policy (`always` / `on-failure` / `never`) и экспоненциальным backoff,
 корректное завершение по SIGTERM/SIGINT, process-группы (`setsid`) и teardown
-всего дерева потомков с эскалацией SIGTERM → `stop-grace-secs` → SIGKILL.
-Впереди — CLI статуса (Этап 5); см. документацию.
+всего дерева потомков с эскалацией SIGTERM → `stop-grace-secs` → SIGKILL,
+CLI с подкомандами `run` / `status` поверх файла состояния. Это полный объём
+MVP; что дальше — в [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md).
 
 ## Быстрый старт
 
@@ -27,9 +28,31 @@ cargo check      # проверка компиляции
 cargo build      # сборка
 cargo test       # тесты
 
-# запуск: путь к конфигу — единственный аргумент
-cargo run -- examples/supervisor.toml
+# запуск демона
+cargo run -- run examples/supervisor.toml
+
+# состояние супервизируемых процессов (из другого терминала)
+cargo run -- status
 ```
+
+`status` печатает по строке на процесс:
+
+```
+NAME                 STATE             PID  RESTARTS  UPTIME
+web                  running        172692         0      1s
+worker               running        172693         0      1s
+```
+
+Если демон не запущен — внятная ошибка в stderr и код возврата 1.
+
+Демон и `status` обмениваются данными через файл состояния:
+`$XDG_RUNTIME_DIR/supervisor-rs/state.toml`, а при незаданном
+`XDG_RUNTIME_DIR` — `/tmp/supervisor-rs-<uid>/state.toml`. Путь
+переопределяется флагом `--state-file <path>` у обеих подкоманд. Демон
+переписывает снапшот раз в секунду, поэтому `status` показывает состояние
+не старше 1 с; при штатной остановке файл удаляется.
+
+Полный список аргументов — `cargo run -- --help`.
 
 Внешних зависимостей нет — это CLI-демон, Docker/сервисы не требуются.
 
