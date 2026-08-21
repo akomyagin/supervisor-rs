@@ -48,6 +48,9 @@ while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
 const MARKER: &str = "marker";
 const PIDFILE: &str = "pids";
 const STATEFILE: &str = "state.toml";
+/// Short name: `sun_path` is limited to ~108 bytes and a tempdir path plus a
+/// long socket name can overflow it with a loud bind error.
+const SOCKFILE: &str = "c.sock";
 
 /// Deadline for the supervisor to shut down after being signalled.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -77,18 +80,26 @@ env = {{ SUP_MARKER = "{marker}", SUP_PIDFILE = "{pidfile}" }}
     config_path
 }
 
-/// Starts the daemon with its state file inside the test's own temp dir.
+/// Starts the daemon with its state file and control socket inside the test's
+/// own temp dir.
 ///
-/// The isolation is mandatory since Этап 5: the default state path is shared
-/// per uid, so parallel tests would overwrite each other's snapshots and the
-/// first daemon to exit would delete the file the others are still publishing.
+/// The isolation is mandatory since Этап 5 for the state file, and since
+/// Этап 6 for the control socket, both for the same reason: the default paths
+/// are one per uid, so parallel tests would collide on them. For the socket
+/// specifically, `ControlServer::bind` in `main.rs` runs *before* the first
+/// spawn and refuses to start a second daemon on a socket a live one already
+/// owns — without `--control-socket` here, every test in this file but the
+/// first to bind would exit 1 immediately and never write its pid file.
 fn start_supervisor(config_path: &Path) -> Child {
     let state_path = config_path.with_file_name(STATEFILE);
+    let socket_path = config_path.with_file_name(SOCKFILE);
     Command::new(env!("CARGO_BIN_EXE_supervisor-rs"))
         .arg("run")
         .arg(config_path)
         .arg("--state-file")
         .arg(state_path)
+        .arg("--control-socket")
+        .arg(socket_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

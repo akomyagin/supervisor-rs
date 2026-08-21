@@ -17,6 +17,7 @@
 
 use crate::clock::Clock;
 use crate::config::{ExitOutcome, ProcessConfig};
+use crate::control::{ControlServer, Request, Response};
 use crate::process;
 use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 use nix::sys::signal::Signal;
@@ -110,6 +111,70 @@ enum StopPhase {
     Killing,
 }
 
+/// What the operator asked for over the control socket (Этап 6). Orthogonal to
+/// both [`StopPhase`] (the per-process TERM→KILL escalation, reused as-is) and
+/// `shutting_down` (whole-supervisor shutdown): intent decides what happens
+/// *after* the leader is reaped, which neither of those tracks. `StopPhase` is
+/// cleared on reaping and `shutting_down` is a mode of the whole supervisor,
+/// while a command is addressed to one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserIntent {
+    /// Normal supervision; the restart policy applies.
+    None,
+    /// `stop <name>`: no respawn after exit, and `done` stays false so the
+    /// daemon keeps running and `start <name>` can revive it. Cleared only by
+    /// `start`. Invariant: `intent == Stopped ⟹ next_restart_at == None`.
+    Stopped,
+    /// `restart <name>`: schedule an immediate respawn once the exit is reaped,
+    /// then revert to `None`. Transient, unlike `Stopped`.
+    RestartPending,
+}
+
+/// The three control verbs, factored out of [`Request`] so the transition table
+/// in `handle_command` matches on `(state, verb)` without repeating the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// A process's state as far as a control command is concerned. Purely local to
+/// `handle_command`'s transition table (§5 of the Этап 6 plan); not the same as
+/// the `status` snapshot's `ProcState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcClass {
+    /// `running.is_some() && stop == Idle`.
+    Running,
+    /// `running.is_some() && stop != Idle` — TERM sent, waiting for the exit.
+    Stopping,
+    /// `running == None && next_restart_at.is_some()` — waiting out a backoff.
+    Backoff,
+    /// `running == None && intent == Stopped` — stopped by the operator.
+    UserStopped,
+    /// `done == true` — terminal.
+    Done,
+}
+
+/// Sends SIGTERM to a live process's group and arms its SIGKILL deadline, the
+/// same escalation `begin_shutdown` uses — but for a single, command-targeted
+/// process. The caller has already set `proc.intent`; a failed signal is logged
+/// and swallowed so a command never aborts on a lost child.
+fn signal_terminate(proc: &mut Supervised<'_>, now: Instant) {
+    if let Some(running) = &proc.running {
+        if let Err(err) = process::signal_group(running.pgid, Signal::SIGTERM) {
+            tracing::error!(
+                name = %proc.config.name,
+                error = %err,
+                "failed to signal process group for operator command"
+            );
+        }
+        proc.stop = StopPhase::Terminating {
+            deadline: now + proc.config.stop_grace(),
+        };
+    }
+}
+
 /// What a single status poll of a live child concluded.
 ///
 /// The poll is expressed as a value instead of acting in place because acting
@@ -145,6 +210,9 @@ struct Supervised<'a> {
     /// reaped.
     running: Option<Running>,
     stop: StopPhase,
+    /// What the operator last asked for over the control socket (Этап 6). Drives
+    /// what happens after the leader is reaped; see [`UserIntent`].
+    intent: UserIntent,
     /// Consecutive status-poll failures; the process is abandoned once
     /// `MAX_CONSECUTIVE_POLL_ERRORS` is reached.
     poll_errors: u32,
@@ -286,6 +354,10 @@ pub struct SupervisorLoop<'a, C: Clock> {
     /// not care about it keep the plain two-argument construction and never
     /// touch the filesystem.
     state_writer: Option<StateWriter>,
+    /// `None` unless a control socket was requested (Этап 6). Opt-in like
+    /// `state_writer`, so tests that do not exercise the socket keep the plain
+    /// construction and never touch it.
+    control_server: Option<ControlServer>,
     /// Set once a shutdown signal has been received; suppresses restarts.
     /// Deliberately per-instance state rather than a global: tests can drive
     /// `begin_shutdown()` directly without touching process-wide signal state.
@@ -313,6 +385,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                         config,
                         running: Some(Running { child, pgid }),
                         stop: StopPhase::Idle,
+                        intent: UserIntent::None,
                         poll_errors: 0,
                         restart_count: 0,
                         started_at: clock.now(),
@@ -332,6 +405,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             clock,
             had_start_errors,
             state_writer: None,
+            control_server: None,
             shutting_down: false,
             shutdown_signal: None,
         }
@@ -344,6 +418,14 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             path,
             next_write_at: None,
         });
+        self
+    }
+
+    /// Listens for `start`/`stop`/`restart` commands on `server` while the loop
+    /// runs, and removes the socket file when it exits cleanly. Opt-in, like
+    /// [`with_state_file`](Self::with_state_file).
+    pub fn with_control_server(mut self, server: ControlServer) -> Self {
+        self.control_server = Some(server);
         self
     }
 
@@ -449,6 +531,157 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                 "failed to write the state file; supervision continues"
             );
         }
+    }
+
+    /// Applies one control request and returns the response line to send back
+    /// (Этап 6).
+    ///
+    /// Pure with respect to sockets — it only mutates supervision state and, for
+    /// `stop`/`restart`, sends a group signal — so in-process tests can drive
+    /// commands without any IO. The actual spawn of a `start`/`restart` is left
+    /// to the ordinary respawn branch of `tick()` (see below), which reuses its
+    /// spawn-error handling, `restart_count` bookkeeping and `started_at`/`pgid`
+    /// setup for free; the reply is therefore an asynchronous *ack* ("the signal
+    /// is sent / the respawn is scheduled"), not a confirmation of the process's
+    /// death or rebirth — observe progress through `status`, like systemctl's
+    /// `--no-block`.
+    pub fn handle_command(&mut self, req: &Request) -> Response {
+        // Shutdown already owns every restart and every StopPhase; a command
+        // wedged into it would race two owners. Refuse all three verbs.
+        if self.shutting_down {
+            return Response::Error("supervisor is shutting down".to_string());
+        }
+
+        let (name, verb) = match req {
+            Request::Start(name) => (name, Verb::Start),
+            Request::Stop(name) => (name, Verb::Stop),
+            Request::Restart(name) => (name, Verb::Restart),
+        };
+
+        // A process whose first spawn failed was never tracked (best-effort
+        // startup of Этап 2), so it is absent here and answers "no such
+        // process" — the same limitation as `status`.
+        let Some(proc) = self.procs.iter_mut().find(|p| &p.config.name == name) else {
+            return Response::Error(format!("no such process \"{name}\""));
+        };
+        let now = self.clock.now();
+
+        // Local state classification for the transition table (§5 of the plan).
+        let state = if proc.done {
+            ProcClass::Done
+        } else if proc.running.is_some() {
+            if proc.stop == StopPhase::Idle {
+                ProcClass::Running
+            } else {
+                // Outside shutdown this is only reachable after a stop/restart
+                // command, so `intent ∈ {Stopped, RestartPending}`.
+                ProcClass::Stopping
+            }
+        } else if proc.next_restart_at.is_some() {
+            ProcClass::Backoff
+        } else if proc.intent == UserIntent::Stopped {
+            ProcClass::UserStopped
+        } else {
+            // running == None, no restart scheduled, not user-stopped, not done:
+            // a transient gap the ordinary respawn branch is about to close.
+            // Treat it as backoff-with-immediate for command purposes.
+            ProcClass::Backoff
+        };
+
+        match (state, verb) {
+            // ---- RUNNING ----
+            (ProcClass::Running, Verb::Stop) => {
+                proc.intent = UserIntent::Stopped;
+                signal_terminate(proc, now);
+                Response::Ok(Some(format!("stopping \"{name}\"")))
+            }
+            (ProcClass::Running, Verb::Start) => {
+                Response::Ok(Some(format!("\"{name}\" is already running")))
+            }
+            (ProcClass::Running, Verb::Restart) => {
+                proc.intent = UserIntent::RestartPending;
+                signal_terminate(proc, now);
+                Response::Ok(Some(format!("restarting \"{name}\"")))
+            }
+            // ---- STOPPING (signal already sent, waiting for exit) ----
+            (ProcClass::Stopping, Verb::Stop) => {
+                // `stop` overrides a restart in flight: after the exit there is
+                // to be no respawn.
+                proc.intent = UserIntent::Stopped;
+                Response::Ok(Some(format!("stopping \"{name}\"")))
+            }
+            (ProcClass::Stopping, Verb::Start) => {
+                Response::Error(format!("\"{name}\" is stopping; retry once it has stopped"))
+            }
+            (ProcClass::Stopping, Verb::Restart) => {
+                if proc.intent == UserIntent::RestartPending {
+                    Response::Ok(Some(format!("\"{name}\" restart already in progress")))
+                } else {
+                    Response::Error(format!("\"{name}\" is stopping"))
+                }
+            }
+            // ---- BACKOFF (waiting out a restart delay) ----
+            (ProcClass::Backoff, Verb::Stop) => {
+                proc.intent = UserIntent::Stopped;
+                // Preserve the invariant Stopped ⟹ next_restart_at == None.
+                proc.next_restart_at = None;
+                Response::Ok(Some(format!("\"{name}\" stopped")))
+            }
+            (ProcClass::Backoff, Verb::Start) => {
+                // Cut the wait short; the backoff *step* is not reset — the
+                // command speeds one restart, it does not declare the process
+                // healthy.
+                proc.next_restart_at = Some(now);
+                Response::Ok(Some(format!("starting \"{name}\"")))
+            }
+            (ProcClass::Backoff, Verb::Restart) => {
+                proc.next_restart_at = Some(now);
+                Response::Ok(Some(format!("restarting \"{name}\"")))
+            }
+            // ---- USER_STOPPED (running == None, intent == Stopped) ----
+            (ProcClass::UserStopped, Verb::Stop) => {
+                Response::Ok(Some(format!("\"{name}\" is already stopped")))
+            }
+            (ProcClass::UserStopped, Verb::Start) => {
+                proc.intent = UserIntent::None;
+                proc.next_restart_at = Some(now);
+                Response::Ok(Some(format!("starting \"{name}\"")))
+            }
+            (ProcClass::UserStopped, Verb::Restart) => {
+                Response::Error(format!("\"{name}\" is stopped; use 'start <name>'"))
+            }
+            // ---- DONE (terminal; never revived — see the note below) ----
+            (ProcClass::Done, Verb::Stop) => {
+                // Idempotent; intent is left untouched — `done` is terminal.
+                Response::Ok(Some(format!("\"{name}\" is already stopped")))
+            }
+            (ProcClass::Done, Verb::Start) => {
+                Response::Error(format!("\"{name}\" has finished and cannot be started"))
+            }
+            (ProcClass::Done, Verb::Restart) => {
+                Response::Error(format!("\"{name}\" has finished and cannot be restarted"))
+            }
+        }
+    }
+
+    /// Polls the control socket for at most one command per tick and applies it.
+    /// A no-op without a control server. Called from `run()` after `tick()`,
+    /// never from `tick()` — the same discipline as `maybe_write_state`.
+    fn poll_control(&mut self) {
+        // Take the accepted stream out from under the server's borrow before
+        // touching `self` mutably in `handle_command`.
+        let stream = match &self.control_server {
+            None => return,
+            Some(server) => server.try_accept(),
+        };
+        let Some(mut stream) = stream else {
+            return;
+        };
+        let resp = match crate::control::read_request(&mut stream) {
+            Ok(req) => self.handle_command(&req),
+            Err(msg) => Response::Error(msg),
+        };
+        crate::control::respond(&mut stream, &resp);
     }
 
     /// Enters shutdown mode: cancels pending restarts and sends `sig` to the
@@ -608,21 +841,46 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                                 name = %proc.config.name,
                                 "process exited during shutdown"
                             );
-                        } else if proc.config.restart.should_restart(outcome) {
-                            if self.clock.now().saturating_duration_since(proc.started_at)
-                                >= STABLE_RESET
-                            {
-                                proc.backoff.reset();
-                            }
-                            let delay = proc.backoff.next_delay();
-                            proc.next_restart_at = Some(self.clock.now() + delay);
-                            tracing::info!(
-                                name = %proc.config.name,
-                                delay = ?delay,
-                                "restart scheduled"
-                            );
                         } else {
-                            proc.done = true;
+                            match proc.intent {
+                                UserIntent::RestartPending => {
+                                    proc.intent = UserIntent::None;
+                                    proc.next_restart_at = Some(self.clock.now());
+                                    tracing::info!(
+                                        name = %proc.config.name,
+                                        "operator restart: respawn scheduled"
+                                    );
+                                }
+                                UserIntent::Stopped => {
+                                    // Not `done`: the daemon stays up so
+                                    // `start <name>` can revive it.
+                                    tracing::info!(
+                                        name = %proc.config.name,
+                                        "stopped by operator"
+                                    );
+                                }
+                                UserIntent::None => {
+                                    if proc.config.restart.should_restart(outcome) {
+                                        if self
+                                            .clock
+                                            .now()
+                                            .saturating_duration_since(proc.started_at)
+                                            >= STABLE_RESET
+                                        {
+                                            proc.backoff.reset();
+                                        }
+                                        let delay = proc.backoff.next_delay();
+                                        proc.next_restart_at = Some(self.clock.now() + delay);
+                                        tracing::info!(
+                                            name = %proc.config.name,
+                                            delay = ?delay,
+                                            "restart scheduled"
+                                        );
+                                    } else {
+                                        proc.done = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     PollOutcome::Failed(err) => handle_poll_error(proc, &err),
@@ -700,6 +958,9 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             // free of side channels and of anything that could block, and the
             // integration tests that drive it directly keep touching no files.
             self.maybe_write_state();
+            // Control-socket handling also lives here and not in `tick()`, for
+            // the same reason: at most one accepted command per tick (Этап 6).
+            self.poll_control();
             self.clock.sleep(TICK);
         }
         // A clean exit removes the file, so "no state file" is the plainest
@@ -708,6 +969,9 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
         // case by the recorded daemon pid.
         if let Some(writer) = &self.state_writer {
             state::remove(&writer.path);
+        }
+        if let Some(server) = &self.control_server {
+            server.cleanup();
         }
     }
 
@@ -813,6 +1077,7 @@ mod tests {
             config: &config,
             running: Some(Running { child, pgid }),
             stop: StopPhase::Idle,
+            intent: UserIntent::None,
             poll_errors: 0,
             restart_count: 0,
             started_at: std::time::Instant::now(),

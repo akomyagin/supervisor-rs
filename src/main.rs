@@ -1,6 +1,6 @@
 //! supervisor-rs — a minimal process supervisor (mini-systemd) for Unix.
 //!
-//! Since Этап 5 the binary has two subcommands. `run <config-path>` is the
+//! Since Этап 5 the binary has multiple subcommands. `run <config-path>` is the
 //! daemon: it loads a TOML config, spawns each configured process as the leader
 //! of its own process group and supervises them — applying the per-process
 //! restart policy (always / on-failure / never) with exponential backoff —
@@ -8,7 +8,9 @@
 //! *group*, so the whole tree a child forked goes down with it; a group that
 //! outlives its `stop-grace-secs` is SIGKILLed, as is one whose leader exits
 //! leaving stragglers behind. While it runs, the daemon publishes a snapshot of
-//! its processes to a state file, which `status` reads and prints.
+//! its processes to a state file, which `status` reads and prints, and listens
+//! on a control socket (Этап 6) for `start`/`stop`/`restart <name>`, operator
+//! commands that reach the running daemon without restarting it.
 //!
 //! See `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
 
@@ -18,12 +20,15 @@ use std::process::ExitCode;
 use supervisor_rs::cli::{self, Command};
 use supervisor_rs::clock::SystemClock;
 use supervisor_rs::config;
+use supervisor_rs::control::{self, ControlServer, Request, Response};
 use supervisor_rs::signal;
 use supervisor_rs::state::{self, ReadError};
 use supervisor_rs::supervise::SupervisorLoop;
 
 /// Exit code for a malformed command line. The rest of the table is unchanged
-/// from Этап 3: bad config → 1, start errors → 1, otherwise 0.
+/// from Этап 3: bad config → 1, start errors → 1, otherwise 0. Этап 6 adds
+/// control-socket bind failure to the "1" class (a startup error, like a bad
+/// config) and gives the start/stop/restart client 0 or 1 by its response.
 const EXIT_USAGE: u8 = 2;
 
 fn main() -> ExitCode {
@@ -42,8 +47,16 @@ fn main() -> ExitCode {
             print!("{}", cli::usage());
             ExitCode::SUCCESS
         }
-        Ok(Command::Run { config, state_file }) => run(&config, state_file),
+        Ok(Command::Run {
+            config,
+            state_file,
+            control_socket,
+        }) => run(&config, state_file, control_socket),
         Ok(Command::Status { state_file }) => status(state_file),
+        Ok(Command::Control {
+            request,
+            control_socket,
+        }) => control_command(&request, control_socket),
         Err(err) => {
             eprintln!("error: {err}");
             eprint!("{}", cli::usage());
@@ -52,7 +65,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(config_path: &std::path::Path, state_file: Option<PathBuf>) -> ExitCode {
+fn run(
+    config_path: &std::path::Path,
+    state_file: Option<PathBuf>,
+    control_socket: Option<PathBuf>,
+) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "supervisor-rs starting"
@@ -75,13 +92,28 @@ fn run(config_path: &std::path::Path, state_file: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Bind the control socket *before* the first spawn: a "someone is already
+    // running" refusal must not be preceded by any child that would then need
+    // tearing down.
+    let socket_path = control_socket.unwrap_or_else(control::default_socket_path);
+    let server = match ControlServer::bind(&socket_path) {
+        Ok(server) => server,
+        Err(err) => {
+            tracing::error!(path = %socket_path.display(), error = %err, "failed to bind control socket");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(path = %server.path().display(), "listening for control commands on");
+
     let state_path = state_file.unwrap_or_else(state::default_path);
     tracing::info!(path = %state_path.display(), "publishing state to");
 
     // A spawn failure means not everything ran as configured — reflect that in
     // the exit code rather than reporting a misleading SUCCESS, even though
     // processes that did spawn are still supervised below.
-    let mut loop_ = SupervisorLoop::new(&config.process, SystemClock).with_state_file(state_path);
+    let mut loop_ = SupervisorLoop::new(&config.process, SystemClock)
+        .with_state_file(state_path)
+        .with_control_server(server);
     let had_start_errors = loop_.had_start_errors();
     loop_.run();
 
@@ -96,6 +128,34 @@ fn run(config_path: &std::path::Path, state_file: Option<PathBuf>) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Sends one `start`/`stop`/`restart` command to the running daemon and prints
+/// its answer (Этап 6).
+///
+/// Everything here goes through `println!`/`eprintln!` rather than `tracing`:
+/// this is the result of a command, not the log of a daemon (see
+/// `.claude/skills/rust-process-supervisor-dev/SKILL.md`).
+fn control_command(request: &Request, control_socket: Option<PathBuf>) -> ExitCode {
+    let path = control_socket.unwrap_or_else(control::default_socket_path);
+    match control::send_command(&path, request) {
+        Ok(Response::Ok(None)) => {
+            println!("ok");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Ok(Some(msg))) => {
+            println!("ok: {msg}");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error(msg)) => {
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(client_err) => {
+            eprintln!("error: {client_err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
