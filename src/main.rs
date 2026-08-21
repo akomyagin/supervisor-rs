@@ -1,21 +1,30 @@
 //! supervisor-rs — a minimal process supervisor (mini-systemd) for Unix.
 //!
-//! Этап 4: loads a TOML config given as the single CLI argument, spawns each
-//! configured process as the leader of its own process group and supervises
-//! them — applying the per-process restart policy (always / on-failure /
-//! never) with exponential backoff — until a SIGTERM/SIGINT arrives. That
-//! signal is forwarded to each process *group*, so the whole tree a child
-//! forked goes down with it; a group that outlives its `stop-grace-secs` is
-//! SIGKILLed, as is one whose leader exits leaving stragglers behind. See
-//! `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
+//! Since Этап 5 the binary has two subcommands. `run <config-path>` is the
+//! daemon: it loads a TOML config, spawns each configured process as the leader
+//! of its own process group and supervises them — applying the per-process
+//! restart policy (always / on-failure / never) with exponential backoff —
+//! until a SIGTERM/SIGINT arrives. That signal is forwarded to each process
+//! *group*, so the whole tree a child forked goes down with it; a group that
+//! outlives its `stop-grace-secs` is SIGKILLed, as is one whose leader exits
+//! leaving stragglers behind. While it runs, the daemon publishes a snapshot of
+//! its processes to a state file, which `status` reads and prints.
+//!
+//! See `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+use supervisor_rs::cli::{self, Command};
 use supervisor_rs::clock::SystemClock;
 use supervisor_rs::config;
 use supervisor_rs::signal;
+use supervisor_rs::state::{self, ReadError};
 use supervisor_rs::supervise::SupervisorLoop;
+
+/// Exit code for a malformed command line. The rest of the table is unchanged
+/// from Этап 3: bad config → 1, start errors → 1, otherwise 0.
+const EXIT_USAGE: u8 = 2;
 
 fn main() -> ExitCode {
     // Structured logging is initialised once, here at the top of the process.
@@ -27,21 +36,29 @@ fn main() -> ExitCode {
         )
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match cli::parse(&args) {
+        Ok(Command::Help) => {
+            print!("{}", cli::usage());
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Run { config, state_file }) => run(&config, state_file),
+        Ok(Command::Status { state_file }) => status(state_file),
+        Err(err) => {
+            eprintln!("error: {err}");
+            eprint!("{}", cli::usage());
+            ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn run(config_path: &std::path::Path, state_file: Option<PathBuf>) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "supervisor-rs starting"
     );
 
-    // TODO(Этап 5): expose a status/control CLI subcommand.
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 1 {
-        eprintln!("Usage: supervisor-rs <config-path>");
-        tracing::error!("expected exactly one argument: <config-path>");
-        return ExitCode::from(2);
-    }
-
-    let config = match config::load(Path::new(&args[0])) {
+    let config = match config::load(config_path) {
         Ok(config) => config,
         Err(err) => {
             tracing::error!(error = %err, "failed to load config");
@@ -58,10 +75,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let state_path = state_file.unwrap_or_else(state::default_path);
+    tracing::info!(path = %state_path.display(), "publishing state to");
+
     // A spawn failure means not everything ran as configured — reflect that in
     // the exit code rather than reporting a misleading SUCCESS, even though
     // processes that did spawn are still supervised below.
-    let mut loop_ = SupervisorLoop::new(&config.process, SystemClock);
+    let mut loop_ = SupervisorLoop::new(&config.process, SystemClock).with_state_file(state_path);
     let had_start_errors = loop_.had_start_errors();
     loop_.run();
 
@@ -77,4 +97,68 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Prints the daemon's published snapshot.
+///
+/// Everything a user asked for goes through `println!`/`eprintln!` rather than
+/// `tracing`: this is the result of a command, not the log of a daemon.
+///
+/// Every failure is exit code 1 — "there is no state to show" — with a message
+/// that says which of the four ways it failed.
+fn status(state_file: Option<PathBuf>) -> ExitCode {
+    let path = state_file.unwrap_or_else(state::default_path);
+    let snapshot = match state::read(&path) {
+        Ok(snapshot) => snapshot,
+        Err(ReadError::NotFound) => {
+            eprintln!(
+                "error: supervisor is not running (no state file at {})",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(ReadError::UnsupportedVersion(version)) => {
+            eprintln!(
+                "error: state file {} has unsupported version {version} (expected {})",
+                path.display(),
+                state::STATE_VERSION
+            );
+            return ExitCode::FAILURE;
+        }
+        // The atomic rename means a parse error is real corruption, not a race
+        // with the writer.
+        Err(err @ (ReadError::Io(_) | ReadError::Parse(_))) => {
+            eprintln!("error: failed to read state file {}: {err}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if !state::daemon_alive(snapshot.daemon_pid) {
+        // Read-only command: a file belonging to someone else's daemon is
+        // reported, never deleted.
+        eprintln!(
+            "error: supervisor is not running (state file {} is stale: daemon pid {} is gone)",
+            path.display(),
+            snapshot.daemon_pid
+        );
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "{:<20} {:<12} {:>8} {:>9} {:>7}",
+        "NAME", "STATE", "PID", "RESTARTS", "UPTIME"
+    );
+    for proc in &snapshot.process {
+        let pid = proc
+            .pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+        let uptime = proc
+            .uptime_secs
+            .map_or_else(|| "-".to_string(), |secs| format!("{secs}s"));
+        println!(
+            "{:<20} {:<12} {:>8} {:>9} {:>7}",
+            proc.name, proc.state, pid, proc.restart_count, uptime
+        );
+    }
+    ExitCode::SUCCESS
 }

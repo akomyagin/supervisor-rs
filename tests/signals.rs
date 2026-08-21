@@ -47,6 +47,7 @@ while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
 
 const MARKER: &str = "marker";
 const PIDFILE: &str = "pids";
+const STATEFILE: &str = "state.toml";
 
 /// Deadline for the supervisor to shut down after being signalled.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,9 +77,18 @@ env = {{ SUP_MARKER = "{marker}", SUP_PIDFILE = "{pidfile}" }}
     config_path
 }
 
+/// Starts the daemon with its state file inside the test's own temp dir.
+///
+/// The isolation is mandatory since Этап 5: the default state path is shared
+/// per uid, so parallel tests would overwrite each other's snapshots and the
+/// first daemon to exit would delete the file the others are still publishing.
 fn start_supervisor(config_path: &Path) -> Child {
+    let state_path = config_path.with_file_name(STATEFILE);
     Command::new(env!("CARGO_BIN_EXE_supervisor-rs"))
+        .arg("run")
         .arg(config_path)
+        .arg("--state-file")
+        .arg(state_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

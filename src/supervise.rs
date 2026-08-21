@@ -18,9 +18,11 @@
 use crate::clock::Clock;
 use crate::config::{ExitOutcome, ProcessConfig};
 use crate::process;
+use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -44,6 +46,11 @@ const KILL_RETRY: Duration = Duration::from_secs(1);
 /// not enough.
 const REAP_RETRIES: u32 = 10;
 const REAP_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// How often the daemon republishes the state snapshot (Этап 5). One second:
+/// fresh enough for a human-facing `status` command, and 20× less IO than
+/// writing on every 50 ms tick. The cost is the documented staleness bound —
+/// what `status` prints is at most `STATE_WRITE_INTERVAL` old.
+pub const STATE_WRITE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Backoff {
     current: Duration,
@@ -115,17 +122,28 @@ enum PollOutcome {
     Failed(String),
 }
 
+/// A live (or exited-but-not-yet-reaped) child together with its process group.
+///
+/// The two used to be separate `Option` fields obliged to stay in step; merging
+/// them makes `child.is_some() ⟺ pgid.is_some()` a property of the type instead
+/// of an invariant every mutation had to re-prove — and removes the `pgid: None`
+/// arms that were unreachable while a child existed.
+struct Running {
+    child: std::process::Child,
+    /// pgid == leader pid, set right after spawn (the child is made a session
+    /// leader by `pre_exec` setsid). This struct exists exactly while the leader
+    /// is alive or an unreaped zombie — the window in which the kernel cannot
+    /// recycle the pgid, so `killpg` on it is safe. It is dropped only after the
+    /// leader has been reaped. Never derive the pgid lazily from `child.id()`:
+    /// once reaped, the pid may already belong to somebody else.
+    pgid: Pid,
+}
+
 struct Supervised<'a> {
     config: &'a ProcessConfig,
-    child: Option<std::process::Child>,
-    /// Process group of the current child; pgid == leader pid, set right after
-    /// spawn (the child is made a session leader by `pre_exec` setsid). `Some`
-    /// while the leader is alive or an unreaped zombie — exactly the window in
-    /// which the kernel cannot recycle the pgid, so `killpg` on it is safe.
-    /// Cleared only after the leader is reaped. Never derive it lazily from
-    /// `child.id()`: once reaped, `Child` is consumed and the pid may already
-    /// belong to somebody else.
-    pgid: Option<Pid>,
+    /// `Some` ⇔ "killpg on `pgid` is safe"; cleared only after the leader is
+    /// reaped.
+    running: Option<Running>,
     stop: StopPhase,
     /// Consecutive status-poll failures; the process is abandoned once
     /// `MAX_CONSECUTIVE_POLL_ERRORS` is reached.
@@ -156,20 +174,18 @@ struct Supervised<'a> {
 /// path the sweep is what keeps a new instance from coming up on top of the
 /// old tree; for a childless process it hits a group holding one zombie and is
 /// a harmless no-op.
-fn poll_child(child: &mut std::process::Child, pgid: Option<Pid>, name: &str) -> PollOutcome {
-    match process::peek_exited(child) {
+fn poll_child(running: &mut Running, name: &str) -> PollOutcome {
+    match process::peek_exited(&running.child) {
         Ok(false) => PollOutcome::Running,
         Ok(true) => {
-            if let Some(pgid) = pgid {
-                if let Err(err) = process::signal_group(pgid, Signal::SIGKILL) {
-                    tracing::error!(
-                        name = %name,
-                        error = %err,
-                        "failed to sweep process group after leader exit"
-                    );
-                }
+            if let Err(err) = process::signal_group(running.pgid, Signal::SIGKILL) {
+                tracing::error!(
+                    name = %name,
+                    error = %err,
+                    "failed to sweep process group after leader exit"
+                );
             }
-            match child.try_wait() {
+            match running.child.try_wait() {
                 Ok(Some(status)) => PollOutcome::Exited(status),
                 // Unreachable after a positive peek — the status is there to be
                 // collected. Reported as a poll failure rather than panicking.
@@ -201,8 +217,8 @@ fn handle_poll_error(proc: &mut Supervised<'_>, err: &str) {
     }
     // Best-effort teardown, in the usual order: the leader has not been reaped
     // (we never learned its status), so its pgid is still ours to kill.
-    let killed = match proc.pgid {
-        Some(pgid) => process::signal_group(pgid, Signal::SIGKILL).is_ok(),
+    let killed = match &proc.running {
+        Some(running) => process::signal_group(running.pgid, Signal::SIGKILL).is_ok(),
         None => true,
     };
     // Reaping needs a short real-time retry, not a single attempt: SIGKILL was
@@ -216,9 +232,9 @@ fn handle_poll_error(proc: &mut Supervised<'_>, err: &str) {
     // this path means something is already deeply wrong, and it runs at most
     // once per process.
     let mut reaped = false;
-    if let Some(child) = proc.child.as_mut() {
+    if let Some(running) = proc.running.as_mut() {
         for _ in 0..REAP_RETRIES {
-            match child.try_wait() {
+            match running.child.try_wait() {
                 Ok(Some(_)) => {
                     reaped = true;
                     break;
@@ -229,8 +245,7 @@ fn handle_poll_error(proc: &mut Supervised<'_>, err: &str) {
             }
         }
     }
-    proc.child = None;
-    proc.pgid = None;
+    proc.running = None;
     proc.stop = StopPhase::Idle;
     proc.done = true;
     if killed && reaped {
@@ -255,10 +270,22 @@ fn handle_poll_error(proc: &mut Supervised<'_>, err: &str) {
     }
 }
 
+/// Where and when the daemon publishes its state snapshot.
+struct StateWriter {
+    path: PathBuf,
+    /// `None` until the first write, so the very first `maybe_write_state`
+    /// fires immediately and `status` works right after the daemon starts.
+    next_write_at: Option<Instant>,
+}
+
 pub struct SupervisorLoop<'a, C: Clock> {
     procs: Vec<Supervised<'a>>,
     clock: C,
     had_start_errors: bool,
+    /// `None` unless a state file was requested. Opt-in so the tests that do
+    /// not care about it keep the plain two-argument construction and never
+    /// touch the filesystem.
+    state_writer: Option<StateWriter>,
     /// Set once a shutdown signal has been received; suppresses restarts.
     /// Deliberately per-instance state rather than a global: tests can drive
     /// `begin_shutdown()` directly without touching process-wide signal state.
@@ -284,8 +311,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                     let pgid = Pid::from_raw(child.id() as i32);
                     procs.push(Supervised {
                         config,
-                        child: Some(child),
-                        pgid: Some(pgid),
+                        running: Some(Running { child, pgid }),
                         stop: StopPhase::Idle,
                         poll_errors: 0,
                         restart_count: 0,
@@ -305,14 +331,124 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             procs,
             clock,
             had_start_errors,
+            state_writer: None,
             shutting_down: false,
             shutdown_signal: None,
         }
     }
 
+    /// Publishes the state snapshot to `path` while the loop runs, and removes
+    /// the file when the loop exits cleanly.
+    pub fn with_state_file(mut self, path: PathBuf) -> Self {
+        self.state_writer = Some(StateWriter {
+            path,
+            next_write_at: None,
+        });
+        self
+    }
+
     /// Whether any process failed to spawn during startup.
     pub fn had_start_errors(&self) -> bool {
         self.had_start_errors
+    }
+
+    /// Builds a snapshot of the supervised processes as they are right now.
+    ///
+    /// A pure read of live supervision state; `pub` so in-process tests can
+    /// assert on it without going through the filesystem.
+    ///
+    /// Note what is *not* here: a process whose very first spawn failed was
+    /// never tracked (the best-effort startup of Этап 2), so it appears in
+    /// neither `procs` nor the snapshot. Its failure is reported by the
+    /// daemon's exit code and its startup log instead.
+    pub fn snapshot(&self) -> StateSnapshot {
+        let process = self
+            .procs
+            .iter()
+            .map(|proc| {
+                let (state, pid, uptime_secs) = match (&proc.running, proc.stop, proc.done) {
+                    (Some(running), StopPhase::Idle, _) => (
+                        ProcState::Running,
+                        Some(running.child.id()),
+                        Some(self.uptime_of(proc)),
+                    ),
+                    // Terminating or Killing: the child is still there, we are
+                    // waiting for it to go.
+                    (Some(running), _, _) => (
+                        ProcState::Stopping,
+                        Some(running.child.id()),
+                        Some(self.uptime_of(proc)),
+                    ),
+                    (None, _, false) if proc.next_restart_at.is_some() => {
+                        (ProcState::Restarting, None, None)
+                    }
+                    // Everything else is terminal: policy said no restart, the
+                    // shutdown reaped it, or the poll-error budget gave up.
+                    _ => (ProcState::Stopped, None, None),
+                };
+                ProcessState {
+                    name: proc.config.name.clone(),
+                    state,
+                    pid,
+                    restart_count: proc.restart_count,
+                    uptime_secs,
+                }
+            })
+            .collect();
+
+        StateSnapshot {
+            version: STATE_VERSION,
+            daemon_pid: std::process::id(),
+            // Wall clock, deliberately not routed through `Clock`: this field
+            // is informational only, and widening the Clock trait for it would
+            // make every FakeClock user carry a fake wall clock too.
+            written_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default(),
+            process,
+        }
+    }
+
+    /// Uptime of the current instance, on the injected clock — so it is
+    /// deterministic under `FakeClock`.
+    fn uptime_of(&self, proc: &Supervised<'a>) -> u64 {
+        self.clock
+            .now()
+            .saturating_duration_since(proc.started_at)
+            .as_secs()
+    }
+
+    /// Republishes the snapshot if `STATE_WRITE_INTERVAL` has elapsed on the
+    /// injected clock; a no-op without a state file.
+    ///
+    /// Called from `run()` after `tick()`. `pub` because in-process tests drive
+    /// `tick()` themselves and never enter `run()`. A failed write is a `warn`
+    /// and nothing more: supervision comes first, `status` second, and the
+    /// write interval already caps the log to one line per second.
+    pub fn maybe_write_state(&mut self) {
+        let now = self.clock.now();
+        let due = match &self.state_writer {
+            None => return,
+            Some(writer) => writer.next_write_at.is_none_or(|at| now >= at),
+        };
+        if !due {
+            return;
+        }
+        // The snapshot is taken before the writer is borrowed mutably: it reads
+        // the whole of `self`.
+        let snapshot = self.snapshot();
+        let Some(writer) = self.state_writer.as_mut() else {
+            return;
+        };
+        writer.next_write_at = Some(now + STATE_WRITE_INTERVAL);
+        if let Err(err) = state::write_atomic(&writer.path, &snapshot) {
+            tracing::warn!(
+                path = %writer.path.display(),
+                error = %err,
+                "failed to write the state file; supervision continues"
+            );
+        }
     }
 
     /// Enters shutdown mode: cancels pending restarts and sends `sig` to the
@@ -331,19 +467,17 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             // Drop any scheduled restart: a process waiting out its backoff
             // must not come back to life during shutdown.
             proc.next_restart_at = None;
-            if proc.child.is_some() {
+            if let Some(running) = &proc.running {
                 // The signal goes to the group, not the pid: a child that
                 // forked its own children must take the whole tree down.
-                if let Some(pgid) = proc.pgid {
-                    if let Err(err) = process::signal_group(pgid, sig) {
-                        // A failed forward must not abort the shutdown of the
-                        // remaining processes; log and move on.
-                        tracing::error!(
-                            name = %proc.config.name,
-                            error = %err,
-                            "failed to signal process group"
-                        );
-                    }
+                if let Err(err) = process::signal_group(running.pgid, sig) {
+                    // A failed forward must not abort the shutdown of the
+                    // remaining processes; log and move on.
+                    tracing::error!(
+                        name = %proc.config.name,
+                        error = %err,
+                        "failed to signal process group"
+                    );
                 }
                 let deadline = self.clock.now() + proc.config.stop_grace();
                 proc.stop = StopPhase::Terminating { deadline };
@@ -373,22 +507,19 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             "escalate_to_kill without begin_shutdown would race the restart policy"
         );
         for proc in &mut self.procs {
-            if proc.child.is_none() {
+            let Some(running) = &proc.running else {
                 continue;
-            }
-            let killed = match proc.pgid {
-                Some(pgid) => match process::signal_group(pgid, Signal::SIGKILL) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        tracing::error!(
-                            name = %proc.config.name,
-                            error = %err,
-                            "failed to SIGKILL process group; falling back to the deadline path"
-                        );
-                        false
-                    }
-                },
-                None => true,
+            };
+            let killed = match process::signal_group(running.pgid, Signal::SIGKILL) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::error!(
+                        name = %proc.config.name,
+                        error = %err,
+                        "failed to SIGKILL process group; falling back to the deadline path"
+                    );
+                    false
+                }
             };
             // On failure, hand the process to the deadline path with an expired
             // deadline instead of parking it in the terminal Killing phase: the
@@ -406,8 +537,8 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
 
     pub fn tick(&mut self) {
         for proc in &mut self.procs {
-            if let Some(child) = proc.child.as_mut() {
-                let outcome = poll_child(child, proc.pgid, &proc.config.name);
+            if let Some(running) = proc.running.as_mut() {
+                let outcome = poll_child(running, &proc.config.name);
                 match outcome {
                     PollOutcome::Running => {
                         proc.poll_errors = 0;
@@ -420,23 +551,19 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                                     name = %proc.config.name,
                                     "grace period expired; escalating to SIGKILL"
                                 );
-                                let killed = match proc.pgid {
-                                    Some(pgid) => {
-                                        match process::signal_group(pgid, Signal::SIGKILL) {
-                                            Ok(()) => true,
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    name = %proc.config.name,
-                                                    error = %err,
-                                                    retry_in = ?KILL_RETRY,
-                                                    "failed to SIGKILL process group; will retry"
-                                                );
-                                                false
-                                            }
+                                let killed =
+                                    match process::signal_group(running.pgid, Signal::SIGKILL) {
+                                        Ok(()) => true,
+                                        Err(err) => {
+                                            tracing::error!(
+                                                name = %proc.config.name,
+                                                error = %err,
+                                                retry_in = ?KILL_RETRY,
+                                                "failed to SIGKILL process group; will retry"
+                                            );
+                                            false
                                         }
-                                    }
-                                    None => true,
-                                };
+                                    };
                                 // Advance to Killing only if the signal actually
                                 // went out. Killing is terminal — nothing
                                 // re-examines it — so entering it after a failed
@@ -466,10 +593,11 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                             outcome = ?outcome,
                             "process exited"
                         );
-                        proc.child = None;
                         // The leader has been reaped: the kernel may recycle
-                        // its pgid from now on, so it must never be used again.
-                        proc.pgid = None;
+                        // its pgid from now on, so the pair must never be used
+                        // again. Dropped only here, after `try_wait` collected
+                        // the status inside `poll_child`.
+                        proc.running = None;
                         proc.stop = StopPhase::Idle;
                         if self.shutting_down {
                             // During shutdown the exit is the expected result
@@ -520,9 +648,9 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                             restart_count = proc.restart_count,
                             "process restarted"
                         );
-                        proc.pgid = Some(Pid::from_raw(child.id() as i32));
+                        let pgid = Pid::from_raw(child.id() as i32);
                         proc.stop = StopPhase::Idle;
-                        proc.child = Some(child);
+                        proc.running = Some(Running { child, pgid });
                     }
                     Err(err) => {
                         // Apply the same backoff as a crashing process would get,
@@ -568,7 +696,18 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                 break;
             }
             self.tick();
+            // Publishing lives here rather than in `tick()`: `tick()` stays
+            // free of side channels and of anything that could block, and the
+            // integration tests that drive it directly keep touching no files.
+            self.maybe_write_state();
             self.clock.sleep(TICK);
+        }
+        // A clean exit removes the file, so "no state file" is the plainest
+        // possible answer to "is the supervisor running?". A daemon killed with
+        // SIGKILL or dying in a panic leaves it behind; `status` catches that
+        // case by the recorded daemon pid.
+        if let Some(writer) = &self.state_writer {
+            state::remove(&writer.path);
         }
     }
 
@@ -672,8 +811,7 @@ mod tests {
 
         let mut proc = Supervised {
             config: &config,
-            child: Some(child),
-            pgid: Some(pgid),
+            running: Some(Running { child, pgid }),
             stop: StopPhase::Idle,
             poll_errors: 0,
             restart_count: 0,
@@ -691,8 +829,10 @@ mod tests {
         handle_poll_error(&mut proc, "synthetic poll error");
 
         assert!(proc.done, "process was not abandoned after the budget");
-        assert!(proc.child.is_none(), "child handle was not dropped");
-        assert!(proc.pgid.is_none(), "pgid was not cleared");
+        assert!(
+            proc.running.is_none(),
+            "the child handle and its pgid were not dropped"
+        );
         assert_eq!(proc.stop, StopPhase::Idle);
 
         // The teardown must be more than a state reset: the SIGKILL must have

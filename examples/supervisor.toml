@@ -1,7 +1,12 @@
-# Example supervisor-rs config (shape is finalised in Этап 1; illustrative for now).
+# Example supervisor-rs config. Run it with:
+#
+#   supervisor-rs run examples/supervisor.toml
+#
+# and inspect the result from another terminal with `supervisor-rs status`.
 #
 # Each [[process]] entry describes one supervised process. `command` is an argv
 # array (no shell parsing). `restart` is one of: always | on-failure | never.
+# The `name` is what `status` prints in its NAME column.
 #
 # Every process is started as the leader of its own process group, so shutting
 # the supervisor down takes the whole tree of its descendants with it, not just

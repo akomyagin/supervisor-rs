@@ -17,9 +17,11 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # Low-level Unix syscalls (Этапы 3–4): kill/killpg, setsid, waitpid, signals.
+# Этап 5 adds `user` for `Uid::current()` — the uid in the default state-file
+# path. That is a feature of a dependency we already have, not a new crate.
 # `nix` is the idiomatic safe wrapper over libc; features are enabled per-stage
 # so `cargo check` stays fast and the dependency surface stays explicit.
-nix = { version = "0.29", features = ["signal", "process"] }
+nix = { version = "0.29", features = ["signal", "process", "user"] }
 
 # Structured logging (all stages). `tracing` over ad-hoc println! so log output
 # stays greppable once the monitor loop gets noisy.
