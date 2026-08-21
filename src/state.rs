@@ -96,6 +96,21 @@ impl std::fmt::Display for ProcState {
     }
 }
 
+/// The per-uid runtime directory the daemon keeps its files in:
+/// `$XDG_RUNTIME_DIR/supervisor-rs`, falling back to `/tmp/supervisor-rs-<uid>`.
+///
+/// Created with mode 0700 by [`write_atomic`] (and by the control server the
+/// same way), which is the whole access-control model: only the owning uid can
+/// read the state file or connect to the control socket. Both the state file
+/// (Этап 5) and the control socket (Этап 6) live here, so the XDG-vs-`/tmp`
+/// choice is made in exactly one place.
+pub fn runtime_dir_from(xdg_runtime_dir: Option<&str>) -> PathBuf {
+    match xdg_runtime_dir {
+        Some(dir) if !dir.is_empty() => Path::new(dir).join("supervisor-rs"),
+        _ => PathBuf::from(format!("/tmp/supervisor-rs-{}", Uid::current().as_raw())),
+    }
+}
+
 /// Default location of the state file: `$XDG_RUNTIME_DIR/supervisor-rs/state.toml`,
 /// falling back to `/tmp/supervisor-rs-<uid>/state.toml`.
 pub fn default_path() -> PathBuf {
@@ -108,11 +123,7 @@ pub fn default_path() -> PathBuf {
 /// process-wide environment: `cargo test` runs tests as threads of one process,
 /// and `set_var` there races every other test.
 pub fn default_path_from(xdg_runtime_dir: Option<&str>) -> PathBuf {
-    match xdg_runtime_dir {
-        Some(dir) if !dir.is_empty() => Path::new(dir).join("supervisor-rs").join("state.toml"),
-        _ => PathBuf::from(format!("/tmp/supervisor-rs-{}", Uid::current().as_raw()))
-            .join("state.toml"),
-    }
+    runtime_dir_from(xdg_runtime_dir).join("state.toml")
 }
 
 /// Writes `snapshot` to `path` atomically, creating the parent directory

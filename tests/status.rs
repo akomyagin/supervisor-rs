@@ -22,6 +22,7 @@ use nix::unistd::Pid;
 use supervisor_rs::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 
 const STATEFILE: &str = "state.toml";
+const SOCKFILE: &str = "c.sock";
 
 /// Deadline for the daemon to come up and publish its first snapshot.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,14 +51,19 @@ fn state_path(dir: &Path) -> PathBuf {
     dir.join(STATEFILE)
 }
 
-/// Starts the daemon with its state file inside the test's own temp dir — see
-/// the note in `tests/cli.rs` on why the isolation is mandatory.
+/// Starts the daemon with its state file *and* control socket inside the
+/// test's own temp dir — see the note in `tests/cli.rs` on why isolating both
+/// is mandatory: `run` binds a control socket before the first spawn even
+/// though this file never sends it a command, and an un-isolated bind would
+/// race any other daemon (test or real) using the default path.
 fn start_supervisor(config_path: &Path, state_path: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_supervisor-rs"))
         .arg("run")
         .arg(config_path)
         .arg("--state-file")
         .arg(state_path)
+        .arg("--control-socket")
+        .arg(state_path.with_file_name(SOCKFILE))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

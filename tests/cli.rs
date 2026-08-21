@@ -8,7 +8,11 @@
 //! Every invocation that starts the daemon passes `--state-file` into its own
 //! temporary directory. Tests run in parallel, and the default path is shared
 //! per uid: without the flag they would overwrite each other's snapshots, and
-//! one daemon's cleanup on exit would delete another's file.
+//! one daemon's cleanup on exit would delete another's file. Since Этап 6 the
+//! same applies to `--control-socket`: `ControlServer::bind` runs before the
+//! first spawn and refuses to start a second daemon on a socket a live one
+//! already owns, so without the flag every concurrent `run` here but the first
+//! to bind would exit 1 before doing anything else.
 
 use std::io::Write;
 use std::process::Command;
@@ -20,7 +24,8 @@ fn bin() -> Command {
 }
 
 /// Writes a config into a fresh temp dir and returns the dir plus the command
-/// line to run it: `run <config> --state-file <dir>/state.toml`.
+/// line to run it: `run <config> --state-file <dir>/state.toml --control-socket
+/// <dir>/c.sock`.
 fn run_config(config: &str) -> (TempDir, Command) {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
@@ -31,7 +36,9 @@ fn run_config(config: &str) -> (TempDir, Command) {
     cmd.arg("run")
         .arg(&config_path)
         .arg("--state-file")
-        .arg(dir.path().join("state.toml"));
+        .arg(dir.path().join("state.toml"))
+        .arg("--control-socket")
+        .arg(dir.path().join("c.sock"));
     (dir, cmd)
 }
 
@@ -139,4 +146,30 @@ fn status_on_missing_state_file_exits_one() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not running"), "{stderr}");
+}
+
+/// Этап 6 grammar: `stop`/`start`/`restart` and `--control-socket`. The full
+/// live-daemon lifecycle is exercised in `tests/control.rs`; this file stays
+/// about usage errors, exit codes and help text.
+#[test]
+fn stop_without_name_is_a_usage_error() {
+    let out = bin().arg("stop").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Usage:"), "{stderr}");
+}
+
+#[test]
+fn unknown_flag_on_stop_is_a_usage_error() {
+    let out = bin().arg("stop").arg("web").arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn help_mentions_control_subcommands() {
+    let out = bin().arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("stop"), "{stdout}");
+    assert!(stdout.contains("--control-socket"), "{stdout}");
 }
