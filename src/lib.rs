@@ -5,6 +5,7 @@ pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod control;
+pub mod health;
 pub mod process;
 pub mod signal;
 pub mod state;

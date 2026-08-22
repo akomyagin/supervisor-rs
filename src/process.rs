@@ -162,6 +162,7 @@ mod tests {
             env: None,
             restart: RestartPolicy::default(),
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            health_check: None,
         }
     }
 

@@ -77,11 +77,19 @@ config-файл (TOML)
   останавливает супервизируемый процесс и подавляет для него restart policy,
   `start` возвращает остановленный в супервизию, `restart` принудительно
   пересоздаёт работающий. (Готово.)
+- **Этап 7 — Health-checks.** Активные проверки здоровья вместо простого «peek
+  по pid»: опциональная секция `[process.health-check]` конфигурирует одну
+  пробу на процесс — exec (код выхода), tcp (соединение принято) или http
+  (2xx). `failure-threshold` неуспехов подряд форсирует рестарт живого, но
+  «залипшего» процесса через ту же машину TERM → grace → SIGKILL, что и
+  операторский `restart`. (Готово.)
 
 Подробная техническая разбивка по этапам — в `docs/TECHNICAL_PLAN.md`.
 
 ## После MVP
 
 Nice-to-have, намеренно вырезанное из MVP (ротация логов, cgroups/resource
-limits, health-checks сверх «процесс жив»), собрано в `docs/POST_MVP_PLAN.md`.
-Этап 6 закрыл control-socket из этого списка; остальное там не тронуто.
+limits), собрано в `docs/POST_MVP_PLAN.md`. Этап 6 закрыл control-socket из
+этого списка, Этап 7 — health-checks (с оговоркой: без
+startup/readiness-триады и без hostname/DNS, см. `docs/POST_MVP_PLAN.md`);
+остальное там не тронуто.

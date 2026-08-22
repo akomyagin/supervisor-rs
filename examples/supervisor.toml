@@ -33,3 +33,16 @@ command = ["/usr/bin/env", "sleep", "3600"]
 # workdir = "/srv/worker"
 # env = { RUST_LOG = "info" }
 restart = "always"
+
+# Optional active health check for this process: exec | tcp | http. Failing
+# `failure-threshold` probes in a row forces a restart (TERM -> stop-grace-secs
+# -> SIGKILL), even though the process is still alive. Uncomment to try it:
+#
+# [process.health-check]
+# type = "tcp"
+# port = 8080
+# # host = "127.0.0.1"      # tcp/http only; must be an IP, no DNS lookup
+# interval-secs = 10        # default 10
+# timeout-secs = 5          # default 5
+# failure-threshold = 3     # default 3
+# start-period-secs = 0     # default 0; delay before the first probe
