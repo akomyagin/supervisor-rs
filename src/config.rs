@@ -31,6 +31,12 @@ pub const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 // start-period default is 0 — no separate constant, `#[serde(default)]` gives
 // the `u64` zero directly.
 
+/// Default rotation threshold for a captured log file, bytes (10 MiB) (Этап 9).
+pub const DEFAULT_LOG_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+/// Default number of rotated files kept (`.1` … `.keep`), besides the current
+/// file (Этап 9).
+pub const DEFAULT_LOG_KEEP: u32 = 5;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub process: Vec<ProcessConfig>,
@@ -58,11 +64,20 @@ pub struct ProcessConfig {
     #[serde(rename = "stop-grace-secs", default = "default_stop_grace_secs")]
     pub stop_grace_secs: u64,
     /// Optional active health check (Этап 7). A `[process.health-check]`
-    /// subtable, kept last in the struct so the "scalars before subtables"
-    /// TOML rule holds (same convention as `StateSnapshot`), even though
-    /// `ProcessConfig` only derives `Deserialize`.
+    /// subtable, kept before `log` in the struct so the "scalars before
+    /// subtables" TOML rule holds (same convention as `StateSnapshot`), even
+    /// though `ProcessConfig` only derives `Deserialize`.
     #[serde(rename = "health-check", default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Optional stdout/stderr capture with size-based rotation (Этап 9). A
+    /// `[process.log]` subtable; without it stdio is inherited, exactly as
+    /// before. Kept last of the subtables (subtables ordered by stage of
+    /// appearance) so the "scalars before subtables" TOML rule holds. Derived
+    /// `Clone`/`PartialEq` pick the field up automatically, so the Этап 8
+    /// reload diff sees a changed log section as a config change and forces a
+    /// restart with no new branch.
+    #[serde(default)]
+    pub log: Option<LogConfig>,
 }
 
 fn default_stop_grace_secs() -> u64 {
@@ -264,6 +279,77 @@ impl HealthCheckConfig {
     }
 }
 
+// ---- Log rotation (Этап 9) ----
+//
+// Capture a process's stdout/stderr into files with size-based rotation, fully
+// inside the supervisor. Decision (user's, not to be revisited — see
+// docs/TECHNICAL_PLAN.md, Этап 9): rotation is by size only, at write time, with
+// no signals, external tools or interval timers; both files are separate; a bad
+// section is a config error at load time, never a runtime panic.
+
+fn default_log_max_size() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_LOG_MAX_SIZE_BYTES).expect("log max-size default is non-zero")
+}
+
+fn default_log_keep() -> NonZeroU32 {
+    NonZeroU32::new(DEFAULT_LOG_KEEP).expect("log keep default is non-zero")
+}
+
+/// Raw, as-parsed `[process.log]` section (Этап 9). Cross-field validation (at
+/// least one path, distinct paths) happens in [`LogConfig::validate`], called by
+/// [`load`] — a bad section is a config error at load time, never a runtime
+/// panic (the `HealthCheckConfig` pattern). `Clone` + `PartialEq` keep the Этап 8
+/// reload diff working: a changed log section is a config change like any other
+/// and forces a restart.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LogConfig {
+    /// Capture the child's stdout into this file. Optional: either stream can
+    /// be captured on its own; an uncaptured stream stays inherited. A relative
+    /// path is resolved against the daemon's cwd (like `--state-file`).
+    #[serde(rename = "stdout-path", default)]
+    pub stdout_path: Option<PathBuf>,
+    /// Capture the child's stderr into this file. Same optionality and
+    /// relative-path resolution as `stdout-path`.
+    #[serde(rename = "stderr-path", default)]
+    pub stderr_path: Option<PathBuf>,
+    /// Rotate once the current file reaches this many bytes. NonZero: a zero
+    /// limit would rotate on every write (free type-level validation, the
+    /// `NonZero*` precedent of Этап 7).
+    #[serde(rename = "max-size-bytes", default = "default_log_max_size")]
+    pub max_size_bytes: NonZeroU64,
+    /// How many rotated files to keep (`.1` newest … `.keep` oldest). NonZero:
+    /// zero would delete output right after rotating it.
+    #[serde(default = "default_log_keep")]
+    pub keep: NonZeroU32,
+}
+
+impl LogConfig {
+    /// Validates the section. Pure; unit-tested directly. Every violation is an
+    /// `Err(String)` naming the problem, so [`load`] can turn it into a
+    /// `ConfigError::Invalid` with the process name (the `HealthCheckConfig::probe`
+    /// pattern).
+    pub fn validate(&self) -> Result<(), String> {
+        // 1) at least one of stdout-path / stderr-path — an empty section is
+        //    meaningless and would mask a typo in a key name.
+        if self.stdout_path.is_none() && self.stderr_path.is_none() {
+            return Err(
+                r#"log section requires at least one of "stdout-path" / "stderr-path""#.to_string(),
+            );
+        }
+        // 2) stdout-path != stderr-path — two writer threads on one file would
+        //    race the rotation.
+        if let (Some(out), Some(err)) = (&self.stdout_path, &self.stderr_path) {
+            if out == err {
+                return Err(format!(
+                    r#"log "stdout-path" and "stderr-path" must differ, both are "{}""#,
+                    out.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io {
@@ -276,13 +362,16 @@ pub enum ConfigError {
     },
     /// A syntactically valid config that fails a semantic, cross-field or
     /// cross-process check: a health-check section that fails cross-field
-    /// validation (Этап 7), or a process name that is not unique (Этап 8, the
-    /// by-name reload diff needs a unique key). Reported at load time with
-    /// exit 1, the existing "config error" class — no new exit code.
+    /// validation (Этап 7), a process name that is not unique (Этап 8, the
+    /// by-name reload diff needs a unique key), or a log section that names no
+    /// path, self-collides, or duplicates another process's log path (Этап 9).
+    /// Reported at load time with exit 1, the existing "config error" class —
+    /// no new exit code.
     Invalid {
         path: PathBuf,
         /// Which process and what is wrong, e.g.
-        /// `process "web": health-check type "tcp" requires "port"`.
+        /// `process "web": health-check type "tcp" requires "port"`, or
+        /// `duplicate log path "/var/log/x.log"`.
         message: String,
     },
 }
@@ -356,6 +445,35 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                     path: path.to_path_buf(),
                     message: format!("process \"{}\": {message}", proc.name),
                 });
+            }
+        }
+    }
+    // Cross-field validation of each log section (Этап 9): a section with no
+    // path or with self-colliding paths is caught here, at load time, with the
+    // process name — never a runtime panic.
+    for proc in &config.process {
+        if let Some(log) = &proc.log {
+            if let Err(message) = log.validate() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("process \"{}\": {message}", proc.name),
+                });
+            }
+        }
+    }
+    // Log paths must be globally unique (within a section and across processes):
+    // two writer threads on one file would race the rotation (both rename, both
+    // count size). Precedent: unique process names (Этап 8), same error variant.
+    let mut seen_log_paths = std::collections::HashSet::new();
+    for proc in &config.process {
+        if let Some(log) = &proc.log {
+            for candidate in [&log.stdout_path, &log.stderr_path].into_iter().flatten() {
+                if !seen_log_paths.insert(candidate.as_path()) {
+                    return Err(ConfigError::Invalid {
+                        path: path.to_path_buf(),
+                        message: format!("duplicate log path \"{}\"", candidate.display()),
+                    });
+                }
             }
         }
     }
@@ -899,6 +1017,7 @@ command = ["/usr/bin/env", "false"]
             restart: RestartPolicy::OnFailure,
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             health_check: None,
+            log: None,
         };
         assert_eq!(base, base.clone());
 
@@ -932,5 +1051,203 @@ command = ["/usr/bin/env", "false"]
         let mut health = base.clone();
         health.health_check = Some(hc);
         assert_ne!(base, health);
+
+        // Log section: None -> Some, and Some -> Some with a different
+        // max-size-bytes must both break equality (Этап 9).
+        let log_a: LogConfig = toml::from_str(
+            r#"
+            stdout-path = "/var/log/web.out"
+            max-size-bytes = 1024
+            "#,
+        )
+        .unwrap();
+        let mut with_log = base.clone();
+        with_log.log = Some(log_a.clone());
+        assert_ne!(base, with_log);
+
+        let log_b: LogConfig = toml::from_str(
+            r#"
+            stdout-path = "/var/log/web.out"
+            max-size-bytes = 2048
+            "#,
+        )
+        .unwrap();
+        let mut with_log_b = base.clone();
+        with_log_b.log = Some(log_b);
+        assert_ne!(with_log, with_log_b);
+    }
+
+    // ---- Log rotation (Этап 9) ----
+
+    #[test]
+    fn parses_log_section_full() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.log]
+            stdout-path = "/var/log/web.out"
+            stderr-path = "/var/log/web.err"
+            max-size-bytes = 1048576
+            keep = 3
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let log = config.process[0].log.as_ref().unwrap();
+        assert_eq!(
+            log.stdout_path.as_deref(),
+            Some(Path::new("/var/log/web.out"))
+        );
+        assert_eq!(
+            log.stderr_path.as_deref(),
+            Some(Path::new("/var/log/web.err"))
+        );
+        assert_eq!(log.max_size_bytes.get(), 1048576);
+        assert_eq!(log.keep.get(), 3);
+        log.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_log_with_defaults() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.log]
+            stdout-path = "/var/log/web.out"
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let log = config.process[0].log.as_ref().unwrap();
+        assert_eq!(log.max_size_bytes.get(), DEFAULT_LOG_MAX_SIZE_BYTES);
+        assert_eq!(log.max_size_bytes.get(), 10485760);
+        assert_eq!(log.keep.get(), DEFAULT_LOG_KEEP);
+        assert!(log.stderr_path.is_none());
+        log.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_log_with_only_stderr() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.log]
+            stderr-path = "/var/log/web.err"
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let log = config.process[0].log.as_ref().unwrap();
+        assert!(log.stdout_path.is_none());
+        assert_eq!(
+            log.stderr_path.as_deref(),
+            Some(Path::new("/var/log/web.err"))
+        );
+        log.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_log_without_any_path() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.log]
+max-size-bytes = 1024
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"process "web""#), "{text}");
+        assert!(text.contains("stdout-path"), "{text}");
+        assert!(text.contains("stderr-path"), "{text}");
+    }
+
+    #[test]
+    fn rejects_log_with_identical_paths() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.log]
+stdout-path = "/var/log/same.log"
+stderr-path = "/var/log/same.log"
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"process "web""#), "{text}");
+    }
+
+    #[test]
+    fn rejects_duplicate_log_paths_across_processes() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.log]
+stdout-path = "/var/log/shared.log"
+
+[[process]]
+name = "worker"
+command = ["/usr/bin/env", "true"]
+
+[process.log]
+stderr-path = "/var/log/shared.log"
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(
+            text.contains(r#"duplicate log path "/var/log/shared.log""#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_log_max_size_and_zero_keep() {
+        for field in ["max-size-bytes = 0", "keep = 0"] {
+            let toml_src = format!(
+                r#"
+                [[process]]
+                name = "web"
+                command = ["/usr/bin/env", "true"]
+
+                [process.log]
+                stdout-path = "/var/log/web.out"
+                {field}
+                "#,
+            );
+            assert!(
+                toml::from_str::<Config>(&toml_src).is_err(),
+                "zero must be rejected for: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_without_log_parses() {
+        let toml_src = r#"
+            [[process]]
+            name = "bare"
+            command = ["/usr/bin/env", "true"]
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert!(config.process[0].log.is_none());
     }
 }

@@ -19,6 +19,7 @@ use crate::clock::Clock;
 use crate::config::{ExitOutcome, HealthProbe, ProcessConfig};
 use crate::control::{ControlServer, Request, Response};
 use crate::health;
+use crate::logs;
 use crate::process;
 use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 use nix::sys::signal::Signal;
@@ -54,6 +55,16 @@ const REAP_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// writing on every 50 ms tick. The cost is the documented staleness bound —
 /// what `status` prints is at most `STATE_WRITE_INTERVAL` old.
 pub const STATE_WRITE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long, and in what steps, the reap path waits for the capture readers
+/// (Этап 9) to drain the pipe and finish. Real time, like `REAP_RETRIES`: what
+/// we wait for is the kernel delivering SIGKILL to stragglers plus the reader's
+/// last writes — not logical time, so a `FakeClock` must not skip it. On timeout
+/// the handle is dropped (the thread is detached): the one way to get here is a
+/// descendant that escaped the process group (its own `setsid`) and pins the
+/// pipe open — the Этап 4 "escaped orphan" limitation, which must not wedge the
+/// loop. `100 × 10 ms` = 1 s total (a whole-instance budget, not per thread).
+const LOG_JOIN_RETRIES: u32 = 100;
+const LOG_JOIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub struct Backoff {
     current: Duration,
@@ -213,6 +224,114 @@ fn build_health(config: &ProcessConfig) -> Option<HealthState> {
         })
 }
 
+/// Spawns one process instance and, if capture is configured, its reader threads
+/// (Этап 9) — the shared construction of `start_supervised` and the respawn
+/// branch of `tick()`. A reader thread that cannot be spawned (OS thread
+/// exhaustion) fails the whole instance: the child is SIGKILLed and reaped here,
+/// and the error surfaces as a `SpawnError` — a silently capture-less (or worse,
+/// pipe-wedged) instance would violate the configured contract.
+///
+/// On the OOM path the twin reader (if already started) gets EOF once the child
+/// is killed and exits on its own; the killed fd must not be dropped while the
+/// child is alive (SIGPIPE) nor left open forever (the child would block on a
+/// full pipe buffer), so the child is torn down first, then the error returns.
+fn start_instance(
+    config: &ProcessConfig,
+) -> Result<(Running, Option<LogState>), process::SpawnError> {
+    let process::Spawned {
+        child,
+        stdout_capture,
+        stderr_capture,
+    } = process::spawn(config)?;
+    let pgid = Pid::from_raw(child.id() as i32);
+
+    // No capture configured: the common path, no threads, no LogState.
+    if stdout_capture.is_none() && stderr_capture.is_none() {
+        return Ok((Running { child, pgid }, None));
+    }
+
+    // `Some(fd)` ⟹ the section named a path for that stream (spawn only builds a
+    // pipe when the path is present), so `config.log` and the path are present.
+    let log = config
+        .log
+        .as_ref()
+        .expect("a capture fd exists ⟹ the config has a log section");
+    let max_size = log.max_size_bytes.get();
+    let keep = log.keep.get();
+
+    let spawn_reader = |fd: std::os::fd::OwnedFd, path: &std::path::Path, stream| {
+        logs::spawn_reader(
+            fd,
+            path.to_path_buf(),
+            max_size,
+            keep,
+            config.name.clone(),
+            stream,
+        )
+    };
+
+    let stdout_handle = match stdout_capture {
+        Some(fd) => {
+            let path = log
+                .stdout_path
+                .as_ref()
+                .expect("stdout captured ⟹ stdout-path set");
+            match spawn_reader(fd, path, "stdout") {
+                Ok(h) => Some(h),
+                Err(source) => {
+                    kill_and_reap_instance(child, pgid, &config.name);
+                    return Err(process::SpawnError::Spawn {
+                        name: config.name.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+    let stderr_handle = match stderr_capture {
+        Some(fd) => {
+            let path = log
+                .stderr_path
+                .as_ref()
+                .expect("stderr captured ⟹ stderr-path set");
+            match spawn_reader(fd, path, "stderr") {
+                Ok(h) => Some(h),
+                Err(source) => {
+                    kill_and_reap_instance(child, pgid, &config.name);
+                    // The stdout reader (if any) gets EOF once the child dies and
+                    // exits on its own; not joined here — this is the error path.
+                    return Err(process::SpawnError::Spawn {
+                        name: config.name.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+
+    Ok((
+        Running { child, pgid },
+        Some(LogState {
+            stdout: stdout_handle,
+            stderr: stderr_handle,
+        }),
+    ))
+}
+
+/// SIGKILLs and reaps a just-spawned instance whose reader-thread setup failed
+/// (Этап 9). Reaping is mandatory — like the exec-probe of Этап 7 reaping a
+/// timed-out child — so a failed capture setup does not leak a zombie.
+fn kill_and_reap_instance(mut child: std::process::Child, pgid: Pid, name: &str) {
+    if let Err(err) = process::signal_group(pgid, Signal::SIGKILL) {
+        tracing::error!(name = %name, error = %err, "failed to kill instance after reader-thread setup failure");
+    }
+    if let Err(err) = child.wait() {
+        tracing::error!(name = %name, error = %err, "failed to reap instance after reader-thread setup failure");
+    }
+}
+
 /// Spawns one process and wraps it into a fresh `Supervised` entry — the shared
 /// construction of `new()` and the reload "added" path (Этап 8). The caller
 /// logs the error and decides what it means (`had_start_errors` at startup;
@@ -221,13 +340,12 @@ fn start_supervised(
     config: Arc<ProcessConfig>,
     now: Instant,
 ) -> Result<Supervised, process::SpawnError> {
-    let child = process::spawn(&config)?;
-    tracing::info!(name = %config.name, pid = child.id(), "process spawned");
-    let pgid = Pid::from_raw(child.id() as i32);
+    let (running, log) = start_instance(&config)?;
+    tracing::info!(name = %config.name, pid = running.child.id(), "process spawned");
     let health = build_health(&config);
     Ok(Supervised {
         config,
-        running: Some(Running { child, pgid }),
+        running: Some(running),
         stop: StopPhase::Idle,
         intent: UserIntent::None,
         poll_errors: 0,
@@ -238,7 +356,52 @@ fn start_supervised(
         done: false,
         pending_removal: false,
         health,
+        log,
     })
+}
+
+/// Bounded join of the current instance's capture reader threads (Этап 9); call
+/// once the leader has been reaped, at which point EOF is guaranteed to converge
+/// (the Этап 4 killpg-sweep on leader exit has closed every write end the tree
+/// held). A no-op when the instance had no capture.
+///
+/// Bounded, not a bare `join()`: a descendant that escaped the process group
+/// (its own `setsid`) is unreachable by killpg — the Этап 4 "escaped orphan"
+/// limitation — and would pin the pipe open, so a bare join would wedge `tick()`
+/// and with it the whole daemon forever. On timeout the handle is dropped
+/// (detached): the escaped orphan keeps its old reader alive and its output
+/// keeps landing in the file, but the old and new readers of the same path are
+/// no longer rotation-synchronised (plan §11) — strictly better than a hung
+/// daemon. Blocking the loop for up to 1 s here is the fourth sanctioned
+/// exception to "the loop never blocks" (after `handle_poll_error`, the socket
+/// timeout and the probe timeout); the normal case is the first poll.
+fn join_log_readers(proc: &mut Supervised) {
+    let Some(log) = proc.log.take() else {
+        return;
+    };
+    let name = &proc.config.name;
+    // One shared real-time deadline for both handles (a whole-instance budget).
+    let deadline = Instant::now() + LOG_JOIN_RETRY_DELAY * LOG_JOIN_RETRIES;
+    for (handle, stream) in [(log.stdout, "stdout"), (log.stderr, "stderr")] {
+        let Some(handle) = handle else {
+            continue;
+        };
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(LOG_JOIN_RETRY_DELAY);
+        }
+        if handle.is_finished() {
+            if let Err(panic) = handle.join() {
+                tracing::error!(name = %name, stream, ?panic, "log reader thread panicked");
+            }
+        } else {
+            // Detach: an escaped-group orphan is pinning the pipe open (§11).
+            tracing::warn!(
+                name = %name,
+                stream,
+                "log reader did not finish in time; detaching it (a descendant escaped the process group and is holding the pipe open)"
+            );
+        }
+    }
 }
 
 /// What a reload decided for each process name, as indices — pure data so the
@@ -320,6 +483,16 @@ struct HealthState {
     consecutive_failures: u32,
 }
 
+/// Handles of the capture reader threads for the *current* instance (Этап 9).
+/// Present exactly when the instance was spawned with at least one capture pipe.
+/// Unlike `health` (config-derived, stable across an instance's life), this is
+/// instance-derived: armed at every (re)spawn, taken at reap. All rotation state
+/// lives inside the threads (plan §2.1); the supervisor only ever joins them.
+struct LogState {
+    stdout: Option<std::thread::JoinHandle<()>>,
+    stderr: Option<std::thread::JoinHandle<()>>,
+}
+
 /// A live (or exited-but-not-yet-reaped) child together with its process group.
 ///
 /// The two used to be separate `Option` fields obliged to stay in step; merging
@@ -371,6 +544,10 @@ struct Supervised {
     /// here — they are read from `config.health_check`, the single source of
     /// truth.
     health: Option<HealthState>,
+    /// Capture reader threads of the current instance (Этап 9); `Some` ⇔ the
+    /// instance was spawned with at least one capture pipe. Armed at (re)spawn
+    /// in `start_instance`, joined and taken at reap in `join_log_readers`.
+    log: Option<LogState>,
 }
 
 /// Polls a live child and, if it has exited, sweeps its process group with
@@ -465,6 +642,10 @@ fn handle_poll_error(proc: &mut Supervised, err: &str) {
     }
     proc.running = None;
     proc.stop = StopPhase::Idle;
+    // Join the capture readers on the give-up path too (Этап 9): the leader was
+    // SIGKILLed and best-effort reaped, so EOF converges the same way as on a
+    // normal exit. Bounded — an escaped orphan must not wedge the loop.
+    join_log_readers(proc);
     proc.done = true;
     if killed && reaped {
         tracing::error!(
@@ -1272,6 +1453,14 @@ impl<C: Clock> SupervisorLoop<C> {
                         // the status inside `poll_child`.
                         proc.running = None;
                         proc.stop = StopPhase::Idle;
+                        // Join the capture readers now (Этап 9): the leader is
+                        // reaped, so EOF has converged (killpg-sweep closed every
+                        // write end), and joining here — before any respawn opens
+                        // a new reader on the same path — keeps "one writer per
+                        // file". Covers every path below (policy restart, operator,
+                        // health, reload-remove, shutdown). Bounded, so an escaped
+                        // orphan cannot wedge the loop (§6.3).
+                        join_log_readers(proc);
                         if self.shutting_down {
                             // During shutdown the exit is the expected result
                             // of our own forwarded signal — the restart policy
@@ -1345,21 +1534,21 @@ impl<C: Clock> SupervisorLoop<C> {
                     .next_restart_at
                     .is_some_and(|at| self.clock.now() >= at)
             {
-                match process::spawn(&proc.config) {
-                    Ok(child) => {
+                match start_instance(&proc.config) {
+                    Ok((running, log_state)) => {
                         proc.restart_count += 1;
                         proc.started_at = self.clock.now();
                         proc.next_restart_at = None;
                         proc.poll_errors = 0;
                         tracing::info!(
                             name = %proc.config.name,
-                            pid = child.id(),
+                            pid = running.child.id(),
                             restart_count = proc.restart_count,
                             "process restarted"
                         );
-                        let pgid = Pid::from_raw(child.id() as i32);
                         proc.stop = StopPhase::Idle;
-                        proc.running = Some(Running { child, pgid });
+                        proc.running = Some(running);
+                        proc.log = log_state;
                     }
                     Err(err) => {
                         // Apply the same backoff as a crashing process would get,
@@ -1539,8 +1728,9 @@ mod tests {
             restart: crate::config::RestartPolicy::Never,
             stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
             health_check: None,
+            log: None,
         };
-        let child = process::spawn(&config).unwrap();
+        let child = process::spawn(&config).unwrap().child;
         let pid = Pid::from_raw(child.id() as i32);
         let pgid = Pid::from_raw(child.id() as i32);
 
@@ -1557,6 +1747,7 @@ mod tests {
             done: false,
             pending_removal: false,
             health: None,
+            log: None,
         };
 
         for i in 1..MAX_CONSECUTIVE_POLL_ERRORS {
@@ -1628,6 +1819,7 @@ mod tests {
             restart: crate::config::RestartPolicy::OnFailure,
             stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
             health_check: None,
+            log: None,
         }
     }
 
@@ -1691,6 +1883,19 @@ mod tests {
         let mut health_to = base.clone();
         health_to.health_check = Some(hc_other);
 
+        // Log section: None → Some, and Some → different Some (Этап 9).
+        let log_add: crate::config::LogConfig =
+            toml::from_str("stdout-path = \"/var/log/web.out\"\nmax-size-bytes = 1024\n").unwrap();
+        let mut log_added = base.clone();
+        log_added.log = Some(log_add.clone());
+
+        let log_other: crate::config::LogConfig =
+            toml::from_str("stdout-path = \"/var/log/web.out\"\nmax-size-bytes = 2048\n").unwrap();
+        let mut log_from = base.clone();
+        log_from.log = Some(log_add);
+        let mut log_to = base.clone();
+        log_to.log = Some(log_other);
+
         for (old_cfg, new_cfg) in [
             (&base, &command),
             (&base, &env),
@@ -1699,6 +1904,8 @@ mod tests {
             (&base, &grace),
             (&base, &health_added),
             (&health_from, &health_to),
+            (&base, &log_added),
+            (&log_from, &log_to),
         ] {
             let old = [old_cfg.clone()];
             let new = [new_cfg.clone()];
