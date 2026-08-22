@@ -14,14 +14,15 @@ policy (`always` / `on-failure` / `never`), а при собственном з�
 
 ## Статус
 
-Готовы Этапы 0–6: парсинг TOML-конфига, запуск процессов и супервизия с
+Готовы Этапы 0–7: парсинг TOML-конфига, запуск процессов и супервизия с
 restart policy (`always` / `on-failure` / `never`) и экспоненциальным backoff,
 корректное завершение по SIGTERM/SIGINT, process-группы (`setsid`) и teardown
 всего дерева потомков с эскалацией SIGTERM → `stop-grace-secs` → SIGKILL,
-CLI с подкомандами `run` / `status` поверх файла состояния (MVP, Этапы 1–5), и
+CLI с подкомандами `run` / `status` поверх файла состояния (MVP, Этапы 1–5),
 управляющий control-socket с подкомандами `start` / `stop` / `restart <name>`
-на работающем демоне (Этап 6, первый пост-MVP). Что дальше — в
-[`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md).
+на работающем демоне (Этап 6), и активные health-checks — exec/tcp/http-пробы,
+форсирующие рестарт «залипшего» процесса по порогу неуспехов подряд (Этап 7).
+Что дальше — в [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md).
 
 ## Быстрый старт
 
@@ -72,7 +73,23 @@ web` принудительно пересоздаёт работающий пр
 переопределяется флагом `--control-socket <path>` у `run`/`start`/`stop`/
 `restart`. При штатной остановке демона файл сокета удаляется.
 
-Полный список аргументов — `cargo run -- --help`.
+Процесс может нести опциональную проверку здоровья — секция
+`[process.health-check]`:
+
+```toml
+[process.health-check]
+type = "http"                # exec | tcp | http
+port = 8080                  # tcp/http: обязательное
+path = "/health"              # http: default "/"
+interval-secs = 10            # default 10
+timeout-secs = 5              # default 5
+failure-threshold = 3         # default 3
+start-period-secs = 15        # default 0, задержка перед первой пробой
+```
+
+`failure-threshold` неуспехов подряд принудительно перезапускает процесс, даже
+живой, но «залипший» — тем же путём TERM → `stop-grace-secs` → SIGKILL, что и
+`restart <name>`. Полный список аргументов — `cargo run -- --help`.
 
 Внешних зависимостей нет — это CLI-демон, Docker/сервисы не требуются.
 

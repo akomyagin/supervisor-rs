@@ -14,11 +14,22 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default grace period between the shutdown signal and SIGKILL, seconds.
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
+
+/// Default seconds between health-check probes (Этап 7).
+pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 10;
+/// Default per-probe timeout, seconds (Этап 7).
+pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 5;
+/// Default number of consecutive probe failures that forces a restart (Этап 7).
+pub const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
+// start-period default is 0 — no separate constant, `#[serde(default)]` gives
+// the `u64` zero directly.
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -43,6 +54,12 @@ pub struct ProcessConfig {
     /// rather than `rename_all` on the struct.
     #[serde(rename = "stop-grace-secs", default = "default_stop_grace_secs")]
     pub stop_grace_secs: u64,
+    /// Optional active health check (Этап 7). A `[process.health-check]`
+    /// subtable, kept last in the struct so the "scalars before subtables"
+    /// TOML rule holds (same convention as `StateSnapshot`), even though
+    /// `ProcessConfig` only derives `Deserialize`.
+    #[serde(rename = "health-check", default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 fn default_stop_grace_secs() -> u64 {
@@ -81,6 +98,165 @@ impl RestartPolicy {
     }
 }
 
+// ---- Health checks (Этап 7) ----
+//
+// Two architectural decisions here are the user's and are not to be revisited
+// (see docs/TECHNICAL_PLAN.md, Этап 7):
+//  1. Probes run in a bounded-blocking way, one probe per tick — the same
+//     pattern as the Этап 6 control socket. The probe *timeout* is real OS time
+//     (SO_RCVTIMEO / connect_timeout / an Instant deadline), deliberately not
+//     routed through `Clock`; only the probe *schedule* rides the injected clock.
+//  2. The HTTP probe is a hand-rolled minimal HTTP/1.1 GET over `std::net`, with
+//     no HTTP crate and no new dependency at all: TCP is `std::net::TcpStream`,
+//     exec is the already-used `std::process::Command`.
+//
+// v1 ships exactly one liveness-style probe per process (threshold failures →
+// restart); the startup/readiness/liveness triad is out of scope — see the plan.
+
+fn default_health_interval() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_HEALTH_INTERVAL_SECS).expect("interval default is non-zero")
+}
+
+fn default_health_timeout() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_HEALTH_TIMEOUT_SECS).expect("timeout default is non-zero")
+}
+
+fn default_health_threshold() -> NonZeroU32 {
+    NonZeroU32::new(DEFAULT_HEALTH_FAILURE_THRESHOLD).expect("threshold default is non-zero")
+}
+
+/// Raw, as-parsed health check section. Cross-field validation (which fields the
+/// chosen `type` requires and which it must not carry) happens in
+/// [`HealthCheckConfig::probe`], called by [`load`] — a bad section is a config
+/// error at load time, never a runtime panic. Manual validation is used instead
+/// of `#[serde(flatten)]` + an internally-tagged enum (a known rough edge of
+/// serde/toml) so the error messages can name the offending field, consistent
+/// with the project's hand-rolled argv parsing. Where a *type* can validate for
+/// free it does: `NonZero*` rejects zeros, `IpAddr` rejects hostnames.
+#[derive(Debug, Deserialize)]
+pub struct HealthCheckConfig {
+    #[serde(rename = "type")]
+    pub kind: ProbeKind,
+    /// exec only.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// tcp/http; an IP address by design — there is no DNS in v1 (std has no
+    /// resolver with a timeout, which would blow the per-probe budget).
+    #[serde(default)]
+    pub host: Option<IpAddr>,
+    /// tcp/http, required there.
+    #[serde(default)]
+    pub port: Option<NonZeroU16>,
+    /// http only; default "/".
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(rename = "interval-secs", default = "default_health_interval")]
+    pub interval_secs: NonZeroU64,
+    #[serde(rename = "timeout-secs", default = "default_health_timeout")]
+    pub timeout_secs: NonZeroU64,
+    #[serde(rename = "failure-threshold", default = "default_health_threshold")]
+    pub failure_threshold: NonZeroU32,
+    /// Delay before the probe schedule starts counting, on top of one interval
+    /// (see the first-probe formula in `supervise.rs`). Zero is meaningful.
+    #[serde(rename = "start-period-secs", default)]
+    pub start_period_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeKind {
+    Exec,
+    Tcp,
+    Http,
+}
+
+/// A validated, ready-to-run probe. Built from the raw section exactly once at
+/// construction; carrying a `SocketAddr` (not host+port) means the runner never
+/// re-parses anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthProbe {
+    Exec { command: Vec<String> },
+    Tcp { addr: SocketAddr },
+    Http { addr: SocketAddr, path: String },
+}
+
+impl HealthCheckConfig {
+    /// Validates the section into a typed probe. Pure; unit-tested directly.
+    /// Every violation is an `Err(String)` naming the offending field, so
+    /// [`load`] can turn it into a `ConfigError::Invalid` with the process name.
+    pub fn probe(&self) -> Result<HealthProbe, String> {
+        let default_host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        match self.kind {
+            ProbeKind::Exec => {
+                if self.host.is_some() {
+                    return Err(r#"health-check type "exec" does not take "host""#.to_string());
+                }
+                if self.port.is_some() {
+                    return Err(r#"health-check type "exec" does not take "port""#.to_string());
+                }
+                if self.path.is_some() {
+                    return Err(r#"health-check type "exec" does not take "path""#.to_string());
+                }
+                match &self.command {
+                    Some(cmd) if !cmd.is_empty() => Ok(HealthProbe::Exec {
+                        command: cmd.clone(),
+                    }),
+                    _ => {
+                        Err(r#"health-check type "exec" requires a non-empty "command""#
+                            .to_string())
+                    }
+                }
+            }
+            ProbeKind::Tcp => {
+                if self.command.is_some() {
+                    return Err(r#"health-check type "tcp" does not take "command""#.to_string());
+                }
+                if self.path.is_some() {
+                    return Err(r#"health-check type "tcp" does not take "path""#.to_string());
+                }
+                let port = self
+                    .port
+                    .ok_or_else(|| r#"health-check type "tcp" requires "port""#.to_string())?;
+                let host = self.host.unwrap_or(default_host);
+                Ok(HealthProbe::Tcp {
+                    addr: SocketAddr::new(host, port.get()),
+                })
+            }
+            ProbeKind::Http => {
+                if self.command.is_some() {
+                    return Err(r#"health-check type "http" does not take "command""#.to_string());
+                }
+                let port = self
+                    .port
+                    .ok_or_else(|| r#"health-check type "http" requires "port""#.to_string())?;
+                let host = self.host.unwrap_or(default_host);
+                let path = self.path.clone().unwrap_or_else(|| "/".to_string());
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        r#"health-check "path" must start with "/", got "{path}""#
+                    ));
+                }
+                Ok(HealthProbe::Http {
+                    addr: SocketAddr::new(host, port.get()),
+                    path,
+                })
+            }
+        }
+    }
+
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_secs.get())
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.get())
+    }
+
+    pub fn start_period(&self) -> Duration {
+        Duration::from_secs(self.start_period_secs)
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io {
@@ -90,6 +266,15 @@ pub enum ConfigError {
     Parse {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    /// A syntactically valid config whose health-check section fails
+    /// cross-field validation (Этап 7). Reported at load time with exit 1, the
+    /// existing "config error" class — no new exit code.
+    Invalid {
+        path: PathBuf,
+        /// Which process and what is wrong, e.g.
+        /// `process "web": health-check type "tcp" requires "port"`.
+        message: String,
     },
 }
 
@@ -112,6 +297,9 @@ impl std::fmt::Display for ConfigError {
                     source
                 )
             }
+            ConfigError::Invalid { path, message } => {
+                write!(f, "invalid config file {}: {}", path.display(), message)
+            }
         }
     }
 }
@@ -121,6 +309,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io { source, .. } => Some(source),
             ConfigError::Parse { source, .. } => Some(source),
+            ConfigError::Invalid { .. } => None,
         }
     }
 }
@@ -130,10 +319,24 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str::<Config>(&contents).map_err(|source| ConfigError::Parse {
+    let config = toml::from_str::<Config>(&contents).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    // Cross-field validation of each health-check section: a syntactically valid
+    // but semantically wrong probe (e.g. tcp without a port) is caught here, at
+    // load time, rather than panicking in the runner.
+    for proc in &config.process {
+        if let Some(hc) = &proc.health_check {
+            if let Err(message) = hc.probe() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("process \"{}\": {message}", proc.name),
+                });
+            }
+        }
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -325,5 +528,314 @@ mod tests {
         let config = load(file.path()).unwrap();
         assert_eq!(config.process.len(), 2);
         assert_eq!(config.process[0].name, "web");
+    }
+
+    // ---- Health checks (Этап 7) ----
+
+    /// Parses a config with a single `[process.health-check]` subtable and
+    /// returns the raw section.
+    fn hc_of(toml_src: &str) -> HealthCheckConfig {
+        let config: Config = toml::from_str(toml_src).unwrap();
+        config
+            .process
+            .into_iter()
+            .next()
+            .unwrap()
+            .health_check
+            .expect("expected a health-check section")
+    }
+
+    #[test]
+    fn parses_exec_health_check() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "exec"
+            command = ["/usr/bin/curl", "-fsS", "http://localhost/health"]
+            "#,
+        );
+        assert_eq!(hc.kind, ProbeKind::Exec);
+        assert_eq!(
+            hc.probe().unwrap(),
+            HealthProbe::Exec {
+                command: vec![
+                    "/usr/bin/curl".to_string(),
+                    "-fsS".to_string(),
+                    "http://localhost/health".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tcp_health_check_with_defaults() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "tcp"
+            port = 8080
+            "#,
+        );
+        assert_eq!(hc.host, None);
+        assert_eq!(hc.interval_secs.get(), DEFAULT_HEALTH_INTERVAL_SECS);
+        assert_eq!(hc.timeout_secs.get(), DEFAULT_HEALTH_TIMEOUT_SECS);
+        assert_eq!(hc.failure_threshold.get(), DEFAULT_HEALTH_FAILURE_THRESHOLD);
+        assert_eq!(hc.start_period_secs, 0);
+        assert_eq!(
+            hc.probe().unwrap(),
+            HealthProbe::Tcp {
+                addr: "127.0.0.1:8080".parse().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_http_health_check_full() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "http"
+            host = "::1"
+            port = 9000
+            path = "/health"
+            interval-secs = 3
+            timeout-secs = 2
+            failure-threshold = 5
+            start-period-secs = 15
+            "#,
+        );
+        assert_eq!(hc.interval(), Duration::from_secs(3));
+        assert_eq!(hc.timeout(), Duration::from_secs(2));
+        assert_eq!(hc.failure_threshold.get(), 5);
+        assert_eq!(hc.start_period(), Duration::from_secs(15));
+        assert_eq!(
+            hc.probe().unwrap(),
+            HealthProbe::Http {
+                addr: "[::1]:9000".parse().unwrap(),
+                path: "/health".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn http_path_defaults_to_slash() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "http"
+            port = 9000
+            "#,
+        );
+        assert_eq!(
+            hc.probe().unwrap(),
+            HealthProbe::Http {
+                addr: "127.0.0.1:9000".parse().unwrap(),
+                path: "/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_tcp_health_check_without_port() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "tcp"
+            "#,
+        );
+        let err = hc.probe().unwrap_err();
+        assert!(err.contains("port"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_exec_health_check_with_empty_command() {
+        // Missing command.
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "exec"
+            "#,
+        );
+        assert!(hc.probe().is_err());
+
+        // Empty command array.
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "exec"
+            command = []
+            "#,
+        );
+        assert!(hc.probe().is_err());
+    }
+
+    #[test]
+    fn rejects_inapplicable_probe_field() {
+        // `port` on an exec probe.
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "exec"
+            command = ["/usr/bin/env", "true"]
+            port = 8080
+            "#,
+        );
+        let err = hc.probe().unwrap_err();
+        assert!(err.contains("port"), "{err:?}");
+
+        // `command` on a tcp probe.
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "tcp"
+            port = 8080
+            command = ["/usr/bin/env", "true"]
+            "#,
+        );
+        let err = hc.probe().unwrap_err();
+        assert!(err.contains("command"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_http_path_without_leading_slash() {
+        let hc = hc_of(
+            r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "http"
+            port = 9000
+            path = "health"
+            "#,
+        );
+        let err = hc.probe().unwrap_err();
+        assert!(err.contains("path"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_hostname_in_health_check_host() {
+        // `host` is typed `IpAddr`, so a hostname is a *parse* error.
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "tcp"
+            host = "localhost"
+            port = 8080
+        "#;
+        assert!(toml::from_str::<Config>(toml_src).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_port_interval_timeout_and_threshold() {
+        for field in [
+            "port = 0",
+            "interval-secs = 0",
+            "timeout-secs = 0",
+            "failure-threshold = 0",
+        ] {
+            let toml_src = format!(
+                r#"
+                [[process]]
+                name = "web"
+                command = ["/usr/bin/env", "true"]
+
+                [process.health-check]
+                type = "tcp"
+                port = 8080
+                {field}
+                "#,
+            );
+            assert!(
+                toml::from_str::<Config>(&toml_src).is_err(),
+                "zero must be rejected for: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_health_check_type() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.health-check]
+            type = "grpc"
+            port = 8080
+        "#;
+        assert!(toml::from_str::<Config>(toml_src).is_err());
+    }
+
+    #[test]
+    fn process_without_health_check_parses() {
+        let toml_src = r#"
+            [[process]]
+            name = "bare"
+            command = ["/usr/bin/env", "true"]
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert!(config.process[0].health_check.is_none());
+    }
+
+    #[test]
+    fn load_reports_invalid_health_check_with_process_name() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.health-check]
+type = "tcp"
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"process "web""#), "{text}");
+        assert!(text.contains("port"), "{text}");
     }
 }

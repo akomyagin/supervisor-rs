@@ -32,6 +32,7 @@ src/
 ├── state.rs     # StateSnapshot, атомарная запись/чтение файла состояния (Этап 5)
 ├── signal.rs    # обработчики SIGTERM/SIGINT, PENDING (Этап 3)
 ├── control.rs   # control-socket: протокол, ControlServer, клиент (Этап 6)
+├── health.rs    # exec/tcp/http пробы: run_probe(), ProbeError (Этап 7)
 ├── supervise.rs # SupervisorLoop: monitor-loop, restart policy, backoff, снапшот, handle_command
 └── process.rs   # spawn / teardown, process groups, waitpid
 ```
@@ -46,7 +47,11 @@ src/
 аргументов и формат снапшота — чистые функции, которые надо уметь звать из
 тестов, а `main.rs` остаётся тонкой обвязкой IO и exit-кодов. `control.rs`
 добавлен в Этапе 6 по тому же принципу: протокол и `ControlServer` — код,
-который юнит-тестируется без всякого запуска демона.
+который юнит-тестируется без всякого запуска демона. `health.rs` добавлен в
+Этапе 7 и намеренно не знает ни о `SupervisorLoop`, ни о `Clock`: это чистая
+функция «выполни одну пробу за ограниченное реальное время», юнит-тестируемая
+на реальных сокетах и командах — расписание же (когда проба должна случиться)
+живёт в `supervise.rs` и ездит на инъектируемых часах.
 
 ## Разбивка по Этапам
 
@@ -476,7 +481,8 @@ src/
 Подкоманды `stop` / `restart <name>` и полноценный control-socket — POST-MVP на
 момент Этапа 5, см. `docs/POST_MVP_PLAN.md`; реализованы в Этапе 6 (см. ниже), но
 **без** перехода цикла на событийную модель — то ожидание не подтвердилось.
-Экспорт метрик и health-checks остаются в POST_MVP_PLAN.md.
+Health-checks реализованы в Этапе 7 (см. ниже). Экспорт метрик остаётся в
+POST_MVP_PLAN.md.
 
 ### Этап 6 — Control-socket (готово)
 
@@ -638,7 +644,159 @@ src/
   `tests/control.rs::stop_start_restart_roundtrip` и соседние тесты ошибочных
   путей.
 
+### Этап 7 — Health-checks (готово)
+
+В MVP «жив» = «процесс существует» (peek по pid). Этап 7 добавляет активные
+проверки здоровья: одна опциональная проба на процесс — **exec** (команда,
+успех по коду выхода 0), **tcp** (порт принимает соединение) или **http**
+(эндпоинт отвечает 2xx). `failure-threshold` неуспехов **подряд** форсирует
+рестарт даже живого, но «залипшего» процесса — через ту же машину
+TERM → grace → SIGKILL, что и операторский `restart` Этапа 6.
+
+**Решение пользователя, не пересматривать: пробы выполняются
+ограниченно-блокирующе, ровно одна проба за тик.** Тот же паттерн, что
+control-socket Этапа 6 (`try_accept` + bounded `set_read_timeout`) и
+`handle_poll_error` Этапа 4 (реальный retry-sleep в цикле) — **третье**
+санкционированное исключение из «цикл не блокирует»: один тик может
+блокироваться на время таймаута одной пробы (`timeout-secs`). Если срок настал
+у нескольких проб разом, за тик исполняется одна (первая по порядку `procs`),
+остальные — на следующих тиках, так что цикл никогда не блокируется на сумму
+нескольких таймаутов. Таймаут пробы — реальное время ОС (`connect_timeout` /
+`SO_RCVTIMEO` / дедлайн по `std::time::Instant`), **API `Clock`/`FakeClock` не
+расширялось**; по инъектируемым часам едет только *расписание* (когда проба
+должна случиться), как у `maybe_write_state`.
+
+**Решение пользователя, не пересматривать: HTTP-проба — самописный минимальный
+HTTP/1.1 GET поверх `std::net::TcpStream`, без внешнего HTTP-крейта.** Запрос
+собирается вручную (`GET {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nConnection:
+close\r\n\r\n`), читается только статус-строка, успех — код `2xx` (3xx — уже
+неуспех, редиректов нет by design). Без TLS, chunked, keep-alive. **Этап не
+добавляет ни одной новой зависимости в `Cargo.toml`** — то же обоснование, что
+TOML вместо `serde_json` и line-протокол вместо фреймворка в Этапах 5–6:
+словарь HTTP-пробы — одна строка запроса и три цифры кода ответа, крейт ради
+этого не окупается.
+
+**Скоуп: одна liveness-проба, без триады startup/readiness/liveness из
+POST_MVP_PLAN.** Обоснование: readiness в k8s управляет маршрутизацией трафика
+— у supervisor-rs нет балансировщика; startup-пробу здесь заменяет
+`start-period-secs` (одно поле вместо второй пробы со своим расписанием);
+liveness — единственный вид, чьё действие (рестарт) вообще есть в арсенале
+супервизора.
+
+- **Конфиг — секция `[process.health-check]` (`src/config.rs`), одна
+  подтаблица, не массив** (одна проба на процесс в v1):
+
+  ```toml
+  [process.health-check]
+  type = "http"                # exec | tcp | http — обязательное
+  port = 8080                  # tcp/http: обязательное
+  path = "/health"             # http: default "/"
+  # host = "127.0.0.1"         # tcp/http: default 127.0.0.1, только IP-адрес
+  interval-secs = 10           # default 10
+  timeout-secs = 5             # default 5
+  failure-threshold = 3        # default 3
+  start-period-secs = 15       # default 0
+  ```
+
+  Разбор — «сырая» `HealthCheckConfig` (serde) → ручная валидация в
+  типизированный `HealthProbe` (`probe()`), не `#[serde(flatten)]` +
+  internally-tagged enum (известная шершавая кромка serde/toml). Бесплатная
+  валидация типами по прецеденту `stop-grace-secs`: `NonZeroU16/32/64` отсекает
+  нули, `IpAddr` отсекает hostname. Правила `probe()`: `exec` требует непустой
+  `command`, `host`/`port`/`path` запрещены; `tcp`/`http` требуют `port`,
+  `command` запрещён; `http`-`path` обязан начинаться с `/`. Некорректная
+  секция — `ConfigError::Invalid` при `load()` (exit 1), не паника в рантайме.
+- **`host` — только `IpAddr`, DNS-резолвинг не поддержан.** У `std` нет
+  резолвинга с таймаутом: `ToSocketAddrs` заблокировал бы поток на
+  неограниченное время и пробил бы бюджет «тик не блокируется дольше таймаута
+  одной пробы». `127.0.0.1` (дефолт) покрывает основной случай — процесс
+  всегда локален. Hostname/DNS — кандидат в POST_MVP.
+- **Раннер (`src/health.rs`)** — `run_probe(probe, timeout) -> Result<(),
+  ProbeError>`, по одной приватной функции на вид пробы, бюджет один на всю
+  пробу (не на каждый шаг): `let deadline = Instant::now() + timeout`, каждый
+  следующий блокирующий шаг получает остаток. exec: три `Stdio::null()`,
+  `try_wait()` в цикле поллинга; дедлайн истёк → `child.kill()` +
+  обязательный `child.wait()` (иначе зомби на всё время жизни демона). tcp:
+  `connect_timeout` + drop. http: см. выше, статус-строка читается побайтово с
+  ограничением `MAX_STATUS_LINE_BYTES`, `set_read/write_timeout` не даёт
+  нулевого значения — минимум 1 мс (у `std` `set_read_timeout(Some(ZERO))` —
+  ошибка).
+- **Расписание (`src/supervise.rs`).** `HealthState { probe, schedule:
+  Option<HealthSchedule>, consecutive_failures }` на `Supervised`. Первая
+  проба текущего инстанса — `started_at + start_period + interval` (при
+  дефолтном `start-period-secs = 0` — через один интервал после старта:
+  проверки в момент `t=0`, пока порт ещё не открыт, не бывает никогда).
+  Последующие пробы — `next_check_at = clock.now() + interval`, назначается
+  **после** завершения пробы. Перевзвод: `schedule.armed_for !=
+  proc.restart_count` → расписание строится заново, счётчик неуспехов
+  обнуляется — `restart_count` как генерация инстанса даёт рестарту любого
+  происхождения (policy/оператор/health) чистый старт **без единой новой
+  ветки** в `tick()`/`handle_command`. Остановленный оператором или гасящийся
+  процесс (`running == None` или `stop != Idle`) пропускается, расписание не
+  двигается. `run_due_health_check()` вызывается из `run()` после
+  `poll_control()`, исполняет **не более одной** due-пробы за вызов.
+- **Переход «залип → рестарт» — переиспользование, не параллельный путь.**
+  Порог неуспехов достигнут → `proc.intent = UserIntent::RestartPending;
+  signal_terminate(...)` — ровно то, что делает `handle_command` на RUNNING ×
+  `restart` (Этап 6). Дальше работает существующая машина
+  `StopPhase`/эскалация/`poll_child`/респавн без единой новой ветки.
+  **Третий вариант интента (`UnhealthyRestart`) осознанно не введён** —
+  продублировал бы арм `RestartPending` в `tick()` и потребовал бы решений по
+  всей STOPPING-строке `handle_command` ради единственного наблюдаемого
+  отличия (подписи одной строчки лога). Единственная правка `tick()` —
+  текст лога в арме `RestartPending`: `"operator restart: respawn scheduled"`
+  → `"forced restart: respawn scheduled"` (интент теперь взводит и health-
+  механизм), плюс doc-комментарии `UserIntent`/`ProcClass::Stopping`. Backoff
+  при health-рестарте не сбрасывается и не применяется — как у операторского
+  `restart`; троттлинг перманентно нездорового процесса — сама каденция проб
+  (минимум `start_period + threshold × interval`).
+- **Тесты.** Юниты `src/health.rs` (14: по виду пробы, таймауты, реап
+  убитого по таймауту exec-ребёнка) и `src/config.rs` (валидация секции,
+  дефолты). In-process `tests/health.rs` (14: расписание/перевзвод/интеракции
+  на `FakeClock`, без реальных проб) — ключевые
+  `reaching_threshold_forces_restart` (рестарт ровно после N неуспехов
+  подряд, не раньше) и `success_resets_consecutive_failures`. E2e
+  `tests/health_e2e.rs` (3, реальный бинарник + реальные TCP/exec-пробы):
+  `unhealthy_process_is_restarted_after_threshold`,
+  `stuck_process_is_killed_via_grace_escalation` (SIGKILL по grace у
+  залипшего), взаимодействие с операторским `stop`. Все 191 тест (было 147 до
+  Этапа 7) проходят; единственная правка существующих — механическое
+  `health_check: None` в литералах `ProcessConfig` во всех тестовых
+  хелперах-`cfg()`.
+- **Границы соблюдены:** `Cargo.toml`, `src/signal.rs`, `src/cli.rs`,
+  `src/control.rs`, `src/main.rs`, схема state-файла (`version = 1`) —
+  без правок.
+- **Известные ограничения Этапа 7** (осознанное поведение, не «чинить»):
+  1. Тик может блокироваться до `timeout-secs` одной пробы — на это время
+     растёт латентность реакции на сигналы, команды сокета и другие пробы;
+     ограничено одной пробой за тик.
+  2. Health не отражён в state-файле/`status` отдельным полем — только логи и
+     косвенно (`stopping`/`restarting`, рост `restart-count`); причина
+     рестарта (оператор vs health) в `status` неразличима — тот же класс, что
+     ограничение 2 Этапа 6.
+  3. `host` — только IP-адрес; hostname/DNS не поддержан.
+  4. exec-проба не получает своей process-группы: потомки зависшей и убитой
+     по таймауту команды-пробы осиротеют. Команда пробы должна быть простой
+     проверкой, не форкать демонов.
+  5. HTTP: без TLS, редиректов, chunked, keep-alive; читается только
+     статус-строка; stdout/stderr exec-пробы отбрасываются.
+  6. Health-рестарт, как и операторский, не применяет backoff и
+     инкрементирует общий `restart_count`.
+  7. Одна проба на процесс; несколько проб и readiness/liveness-разделение —
+     POST_MVP.
+- **Не в скоупе v1**: startup/readiness-пробы отдельно от liveness, hostname/
+  DNS в `host`, несколько проб на процесс, видимость health в `status`.
+- **Критерий приёмки:** на живом демоне процесс со здоровой пробой работает
+  нетронутым (`restart-count` не растёт); при проваливающейся пробе ровно
+  после `failure-threshold` неуспехов подряд — не раньше — процесс
+  перезапускается (новый PID и выросший `restart-count` в `status`), залипший
+  вопреки SIGTERM добивается SIGKILL по `stop-grace-secs`. Успешная проба
+  сбрасывает счётчик. Операторский `stop` останавливает и пробы; shutdown
+  пробами не задерживается. ✅ — `tests/health.rs`, `tests/health_e2e.rs`.
+
 ## Что вырезано из MVP
 
-Ротация логов, cgroups/resource limits, health-checks сложнее «процесс жив» —
-вынесено в `docs/POST_MVP_PLAN.md` и в v1 не реализуется.
+Ротация логов и cgroups/resource limits — вынесено в `docs/POST_MVP_PLAN.md` и
+в v1 не реализуется. Health-checks (exec/tcp/http, одна liveness-проба)
+реализованы в Этапе 7 — см. выше; триада startup/readiness/liveness и
+hostname/DNS остаются кандидатами в `docs/POST_MVP_PLAN.md`.

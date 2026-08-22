@@ -14,6 +14,7 @@ fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
         env: None,
         restart: RestartPolicy::Never,
         stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+        health_check: None,
     }
 }
 

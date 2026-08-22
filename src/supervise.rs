@@ -16,8 +16,9 @@
 //! the injected `FakeClock`.
 
 use crate::clock::Clock;
-use crate::config::{ExitOutcome, ProcessConfig};
+use crate::config::{ExitOutcome, HealthProbe, ProcessConfig};
 use crate::control::{ControlServer, Request, Response};
+use crate::health;
 use crate::process;
 use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 use nix::sys::signal::Signal;
@@ -125,8 +126,12 @@ enum UserIntent {
     /// daemon keeps running and `start <name>` can revive it. Cleared only by
     /// `start`. Invariant: `intent == Stopped ⟹ next_restart_at == None`.
     Stopped,
-    /// `restart <name>`: schedule an immediate respawn once the exit is reaped,
-    /// then revert to `None`. Transient, unlike `Stopped`.
+    /// Schedule an immediate respawn once the exit is reaped, then revert to
+    /// `None`. Transient, unlike `Stopped`. Armed by two triggers: the operator
+    /// `restart <name>` command, and the Этап 7 health-check threshold (a live
+    /// but "stuck" process). Both reuse this one intent so no third variant and
+    /// no extra `tick()` branch are needed; the cause is distinguished only in
+    /// the log at the trigger point.
     RestartPending,
 }
 
@@ -147,6 +152,8 @@ enum ProcClass {
     /// `running.is_some() && stop == Idle`.
     Running,
     /// `running.is_some() && stop != Idle` — TERM sent, waiting for the exit.
+    /// Reached by an operator `stop`/`restart` or by the Этап 7 health threshold
+    /// forcing a restart; all three route through `signal_terminate`.
     Stopping,
     /// `running == None && next_restart_at.is_some()` — waiting out a backoff.
     Backoff,
@@ -166,7 +173,7 @@ fn signal_terminate(proc: &mut Supervised<'_>, now: Instant) {
             tracing::error!(
                 name = %proc.config.name,
                 error = %err,
-                "failed to signal process group for operator command"
+                "failed to signal process group for forced stop/restart"
             );
         }
         proc.stop = StopPhase::Terminating {
@@ -185,6 +192,29 @@ enum PollOutcome {
     Exited(std::process::ExitStatus),
     /// The status could not be determined; carries the message to log.
     Failed(String),
+}
+
+/// Probe schedule for the *current* instance of the process (Этап 7). One
+/// struct, not two `Option`s obliged to agree — the same lesson as merging
+/// child+pgid into `Running` in Этап 5.
+struct HealthSchedule {
+    /// `restart_count` value this schedule was armed for. A mismatch means a new
+    /// instance is up: re-arm afresh (fresh start-period, zeroed failures). The
+    /// counter is the generation marker on purpose — it increments on every
+    /// respawn, whether policy-, operator- or health-triggered.
+    armed_for: u32,
+    /// Next probe is due at this instant, on the injected clock.
+    next_check_at: Instant,
+}
+
+/// Per-process health-check state (Этап 7). Present exactly when the config has
+/// a `[process.health-check]` section.
+struct HealthState {
+    /// Validated once at construction; the runner never parses config.
+    probe: HealthProbe,
+    /// `None` until first armed for an instance.
+    schedule: Option<HealthSchedule>,
+    consecutive_failures: u32,
 }
 
 /// A live (or exited-but-not-yet-reaped) child together with its process group.
@@ -221,6 +251,11 @@ struct Supervised<'a> {
     next_restart_at: Option<Instant>,
     backoff: Backoff,
     done: bool,
+    /// Active health check (Этап 7); `Some` ⇔ the config has a
+    /// `[process.health-check]` section. Intervals/threshold are *not* copied
+    /// here — they are read from `config.health_check`, the single source of
+    /// truth.
+    health: Option<HealthState>,
 }
 
 /// Polls a live child and, if it has exited, sweeps its process group with
@@ -381,6 +416,29 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                 Ok(child) => {
                     tracing::info!(name = %config.name, pid = child.id(), "process spawned");
                     let pgid = Pid::from_raw(child.id() as i32);
+                    // Build the health state from the (already load-validated)
+                    // config. `probe()` cannot fail after `load()`, but in-process
+                    // tests construct `ProcessConfig` by hand, so a bad section is
+                    // logged and dropped (defensive, in the spirit of Этап 2's
+                    // best-effort startup) rather than panicking.
+                    let health = config
+                        .health_check
+                        .as_ref()
+                        .and_then(|hc| match hc.probe() {
+                            Ok(probe) => Some(HealthState {
+                                probe,
+                                schedule: None,
+                                consecutive_failures: 0,
+                            }),
+                            Err(err) => {
+                                tracing::error!(
+                                    name = %config.name,
+                                    error = %err,
+                                    "invalid health-check config; probing disabled for this process"
+                                );
+                                None
+                            }
+                        });
                     procs.push(Supervised {
                         config,
                         running: Some(Running { child, pgid }),
@@ -392,6 +450,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                         next_restart_at: None,
                         backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF, BACKOFF_FACTOR),
                         done: false,
+                        health,
                     });
                 }
                 Err(err) => {
@@ -768,6 +827,129 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
         }
     }
 
+    /// Runs at most ONE due health probe per call (the user's decision: a tick
+    /// may block for up to one probe timeout, never for a sum of them). Called
+    /// from `run()` after `poll_control()`, never from `tick()` — the same
+    /// discipline as `maybe_write_state`. `pub` so in-process tests drive it
+    /// directly with a `FakeClock`.
+    ///
+    /// The scheduling — when a probe is due — rides the injected clock; the
+    /// probe *execution* is bounded by real OS time (`timeout-secs`), so a hung
+    /// server cannot block the loop longer than one timeout. The "stuck →
+    /// restart" transition reuses the existing `StopPhase`/`RestartPending`
+    /// machine wholesale: on threshold this arms `RestartPending` and sends the
+    /// same group TERM as an operator `restart`, then every later step (grace,
+    /// SIGKILL escalation, sweep, respawn) is the untouched existing path.
+    pub fn run_due_health_check(&mut self) {
+        if self.shutting_down {
+            // Shutdown owns every StopPhase; probes must not interfere.
+            return;
+        }
+        let now = self.clock.now();
+        for proc in &mut self.procs {
+            let Some(health) = proc.health.as_mut() else {
+                continue;
+            };
+            // Paused for a stopped or being-stopped process: no live child
+            // (operator stop / backoff / done) or a stop already in flight. An
+            // `intent` check is unnecessary — `Stopped`/`RestartPending` with a
+            // live process always carry `stop != Idle`, and after reaping
+            // `running == None`.
+            if proc.running.is_none() || proc.stop != StopPhase::Idle {
+                continue;
+            }
+
+            // Re-arm on a generation mismatch: a new instance is up, so the
+            // schedule is rebuilt from the current `started_at` with a fresh
+            // start-period and a zeroed failure count. No `continue` afterwards —
+            // the freshly armed schedule is immediately checked for "is it due?"
+            // (it cannot be, since start-period + interval is non-zero, but the
+            // uniform path is simpler to reason about).
+            let hc = proc
+                .config
+                .health_check
+                .as_ref()
+                .expect("health is Some ⟹ config has a health-check section");
+            let armed = matches!(&health.schedule, Some(s) if s.armed_for == proc.restart_count);
+            if !armed {
+                health.schedule = Some(HealthSchedule {
+                    armed_for: proc.restart_count,
+                    next_check_at: proc.started_at + hc.start_period() + hc.interval(),
+                });
+                health.consecutive_failures = 0;
+            }
+
+            let due = health
+                .schedule
+                .as_ref()
+                .is_some_and(|s| now >= s.next_check_at);
+            if !due {
+                continue;
+            }
+
+            // Due: run the one probe. This is the single blocking point, bounded
+            // by `timeout-secs`.
+            let result = health::run_probe(&health.probe, hc.timeout());
+
+            // Read the clock *after* the probe: on a SystemClock the probe took
+            // real time, so the next interval must start from now, not from the
+            // pre-probe instant.
+            let after = self.clock.now();
+            if let Some(schedule) = health.schedule.as_mut() {
+                schedule.next_check_at = after + hc.interval();
+            }
+
+            match result {
+                Ok(()) => {
+                    if health.consecutive_failures > 0 {
+                        tracing::info!(
+                            name = %proc.config.name,
+                            recovered_after = health.consecutive_failures,
+                            "health check healthy again"
+                        );
+                        health.consecutive_failures = 0;
+                    } else {
+                        // A routine success once per interval per process would
+                        // flood the log at info level — keep it at debug.
+                        tracing::debug!(name = %proc.config.name, "health check ok");
+                    }
+                }
+                Err(err) => {
+                    health.consecutive_failures += 1;
+                    let failures = health.consecutive_failures;
+                    let threshold = hc.failure_threshold.get();
+                    tracing::warn!(
+                        name = %proc.config.name,
+                        error = %err,
+                        failures,
+                        threshold,
+                        "health check failed"
+                    );
+                    if failures >= threshold {
+                        tracing::warn!(
+                            name = %proc.config.name,
+                            failures,
+                            "unhealthy after consecutive probe failures; forcing restart"
+                        );
+                        // Exactly what `handle_command` does on RUNNING × restart:
+                        // arm the transient RestartPending intent and TERM the
+                        // group. `signal_terminate` uses fresh clock time so the
+                        // grace is not shortened by the probe's duration. The
+                        // failure counter is left alone — the re-arm on the next
+                        // generation (new `restart_count`) zeroes it.
+                        proc.intent = UserIntent::RestartPending;
+                        signal_terminate(proc, self.clock.now());
+                    }
+                }
+            }
+            // One probe per call: return so a second due probe waits for the
+            // next tick. No starvation — the probe just run pushed its own
+            // `next_check_at` out by an interval, so the next due process wins
+            // the following tick.
+            return;
+        }
+    }
+
     pub fn tick(&mut self) {
         for proc in &mut self.procs {
             if let Some(running) = proc.running.as_mut() {
@@ -846,9 +1028,15 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                                 UserIntent::RestartPending => {
                                     proc.intent = UserIntent::None;
                                     proc.next_restart_at = Some(self.clock.now());
+                                    // Neutral attribution: `RestartPending` is now
+                                    // armed by both `restart <name>` and the health
+                                    // threshold (Этап 7), so "operator restart"
+                                    // would be wrong for a health-forced respawn.
+                                    // The cause is already logged at the trigger
+                                    // (the "forcing restart" warn for health).
                                     tracing::info!(
                                         name = %proc.config.name,
-                                        "operator restart: respawn scheduled"
+                                        "forced restart: respawn scheduled"
                                     );
                                 }
                                 UserIntent::Stopped => {
@@ -961,6 +1149,10 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             // Control-socket handling also lives here and not in `tick()`, for
             // the same reason: at most one accepted command per tick (Этап 6).
             self.poll_control();
+            // Health probes run here too (Этап 7), after `poll_control` so a
+            // `stop` accepted this tick has already armed `StopPhase` and
+            // correctly suppresses the probe. At most one probe per tick.
+            self.run_due_health_check();
             self.clock.sleep(TICK);
         }
         // A clean exit removes the file, so "no state file" is the plainest
@@ -1068,6 +1260,7 @@ mod tests {
             env: None,
             restart: crate::config::RestartPolicy::Never,
             stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
+            health_check: None,
         };
         let child = process::spawn(&config).unwrap();
         let pid = Pid::from_raw(child.id() as i32);
@@ -1084,6 +1277,7 @@ mod tests {
             next_restart_at: None,
             backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF, BACKOFF_FACTOR),
             done: false,
+            health: None,
         };
 
         for i in 1..MAX_CONSECUTIVE_POLL_ERRORS {

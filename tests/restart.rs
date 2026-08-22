@@ -21,6 +21,7 @@ fn cfg(name: &str, command: &[&str], restart: RestartPolicy) -> ProcessConfig {
         env: None,
         restart,
         stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+        health_check: None,
     }
 }
 
