@@ -59,7 +59,7 @@ fn is_alive(pid: u32) -> bool {
 }
 
 /// Ticks with short real sleeps until the process at `index` is done.
-fn tick_until_done(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_done(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if loop_.is_done(index) {
@@ -71,7 +71,7 @@ fn tick_until_done(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
 }
 
 /// Ticks until a restart is scheduled for the process at `index`.
-fn tick_until_restart_scheduled(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_restart_scheduled(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if loop_.next_restart_delay(index).is_some() {

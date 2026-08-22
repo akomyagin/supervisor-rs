@@ -11,6 +11,16 @@
 # Every process is started as the leader of its own process group, so shutting
 # the supervisor down takes the whole tree of its descendants with it, not just
 # the direct child.
+#
+# To reload this file without restarting the daemon, edit it and send SIGHUP:
+#
+#   kill -HUP $(pid of the running supervisor-rs)
+#
+# The daemon re-reads the file, diffs processes by `name` and applies only the
+# difference — added processes are spawned, removed ones are stopped, changed
+# ones are restarted, unchanged ones are left alone. It is all-or-nothing: a
+# broken new config is rejected wholesale and nothing changes. Process names
+# must be unique (the reload diffs by name).
 
 [[process]]
 name = "web"

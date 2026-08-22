@@ -10,7 +10,10 @@
 //! leaving stragglers behind. While it runs, the daemon publishes a snapshot of
 //! its processes to a state file, which `status` reads and prints, and listens
 //! on a control socket (Этап 6) for `start`/`stop`/`restart <name>`, operator
-//! commands that reach the running daemon without restarting it.
+//! commands that reach the running daemon without restarting it. A SIGHUP
+//! (Этап 8) makes it re-read the same config file and apply the diff — spawn
+//! added processes, stop removed ones, restart changed ones — without a daemon
+//! restart; a broken new config is rejected wholesale and changes nothing.
 //!
 //! See `docs/TECHNICAL_PLAN.md` for the per-stage breakdown.
 
@@ -113,7 +116,8 @@ fn run(
     // processes that did spawn are still supervised below.
     let mut loop_ = SupervisorLoop::new(&config.process, SystemClock)
         .with_state_file(state_path)
-        .with_control_server(server);
+        .with_control_server(server)
+        .with_config_reload(config_path.to_path_buf());
     let had_start_errors = loop_.had_start_errors();
     loop_.run();
 

@@ -24,6 +24,7 @@ use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -122,16 +123,19 @@ enum StopPhase {
 enum UserIntent {
     /// Normal supervision; the restart policy applies.
     None,
-    /// `stop <name>`: no respawn after exit, and `done` stays false so the
-    /// daemon keeps running and `start <name>` can revive it. Cleared only by
-    /// `start`. Invariant: `intent == Stopped ⟹ next_restart_at == None`.
+    /// No respawn after exit, and `done` stays false so the daemon keeps
+    /// running. Armed by two triggers: an operator `stop <name>` (revived by a
+    /// later `start`), and a reload that removed the process (Этап 8; the entry
+    /// is then pruned once reaped, never revived). Invariant:
+    /// `intent == Stopped ⟹ next_restart_at == None`.
     Stopped,
     /// Schedule an immediate respawn once the exit is reaped, then revert to
-    /// `None`. Transient, unlike `Stopped`. Armed by two triggers: the operator
-    /// `restart <name>` command, and the Этап 7 health-check threshold (a live
-    /// but "stuck" process). Both reuse this one intent so no third variant and
-    /// no extra `tick()` branch are needed; the cause is distinguished only in
-    /// the log at the trigger point.
+    /// `None`. Transient, unlike `Stopped`. Armed by three triggers: the
+    /// operator `restart <name>` command, the Этап 7 health-check threshold (a
+    /// live but "stuck" process), and a reload that changed the process's
+    /// config (Этап 8). All reuse this one intent so no extra variant and no
+    /// extra `tick()` branch are needed; the cause is distinguished only in the
+    /// log at the trigger point.
     RestartPending,
 }
 
@@ -152,8 +156,9 @@ enum ProcClass {
     /// `running.is_some() && stop == Idle`.
     Running,
     /// `running.is_some() && stop != Idle` — TERM sent, waiting for the exit.
-    /// Reached by an operator `stop`/`restart` or by the Этап 7 health threshold
-    /// forcing a restart; all three route through `signal_terminate`.
+    /// Reached by an operator `stop`/`restart`, the Этап 7 health threshold
+    /// forcing a restart, or an Этап 8 reload changing or removing the process;
+    /// all route through `signal_terminate`.
     Stopping,
     /// `running == None && next_restart_at.is_some()` — waiting out a backoff.
     Backoff,
@@ -167,7 +172,7 @@ enum ProcClass {
 /// same escalation `begin_shutdown` uses — but for a single, command-targeted
 /// process. The caller has already set `proc.intent`; a failed signal is logged
 /// and swallowed so a command never aborts on a lost child.
-fn signal_terminate(proc: &mut Supervised<'_>, now: Instant) {
+fn signal_terminate(proc: &mut Supervised, now: Instant) {
     if let Some(running) = &proc.running {
         if let Err(err) = process::signal_group(running.pgid, Signal::SIGTERM) {
             tracing::error!(
@@ -180,6 +185,104 @@ fn signal_terminate(proc: &mut Supervised<'_>, now: Instant) {
             deadline: now + proc.config.stop_grace(),
         };
     }
+}
+
+/// Builds the health state from an (already validated) config; a bad section is
+/// logged and dropped, never a panic — extracted verbatim from `new()`.
+/// `probe()` cannot fail after `load()`, but in-process tests construct
+/// `ProcessConfig` by hand, so a bad section is logged and dropped (defensive,
+/// in the spirit of Этап 2's best-effort startup) rather than panicking.
+fn build_health(config: &ProcessConfig) -> Option<HealthState> {
+    config
+        .health_check
+        .as_ref()
+        .and_then(|hc| match hc.probe() {
+            Ok(probe) => Some(HealthState {
+                probe,
+                schedule: None,
+                consecutive_failures: 0,
+            }),
+            Err(err) => {
+                tracing::error!(
+                    name = %config.name,
+                    error = %err,
+                    "invalid health-check config; probing disabled for this process"
+                );
+                None
+            }
+        })
+}
+
+/// Spawns one process and wraps it into a fresh `Supervised` entry — the shared
+/// construction of `new()` and the reload "added" path (Этап 8). The caller
+/// logs the error and decides what it means (`had_start_errors` at startup;
+/// skip on reload).
+fn start_supervised(
+    config: Arc<ProcessConfig>,
+    now: Instant,
+) -> Result<Supervised, process::SpawnError> {
+    let child = process::spawn(&config)?;
+    tracing::info!(name = %config.name, pid = child.id(), "process spawned");
+    let pgid = Pid::from_raw(child.id() as i32);
+    let health = build_health(&config);
+    Ok(Supervised {
+        config,
+        running: Some(Running { child, pgid }),
+        stop: StopPhase::Idle,
+        intent: UserIntent::None,
+        poll_errors: 0,
+        restart_count: 0,
+        started_at: now,
+        next_restart_at: None,
+        backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF, BACKOFF_FACTOR),
+        done: false,
+        pending_removal: false,
+        health,
+    })
+}
+
+/// What a reload decided for each process name, as indices — pure data so the
+/// diff is unit-tested without spawning anything (Этап 8). Names are unique on
+/// both sides: `load()` rejects duplicates (and `new()`'s procs inherit
+/// uniqueness from the initial load).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReloadPlan {
+    /// (procs index, new-config index): name present on both sides, configs
+    /// equal. Untouched by apply — except the pending-removal resurrection
+    /// (§6.3, "re-added during removal").
+    unchanged: Vec<(usize, usize)>,
+    /// (procs index, new-config index): name present on both sides, configs
+    /// differ — forced restart.
+    changed: Vec<(usize, usize)>,
+    /// procs indices whose name is gone from the new config.
+    removed: Vec<usize>,
+    /// new-config indices whose name is not currently supervised.
+    added: Vec<usize>,
+}
+
+/// Pure by-name diff of the running config against the newly loaded one. The
+/// vectors follow traversal order (`removed`/`unchanged`/`changed` by `old`,
+/// `added` by `new`), which the unit tests rely on being deterministic.
+fn plan_reload(old: &[&ProcessConfig], new: &[ProcessConfig]) -> ReloadPlan {
+    let mut plan = ReloadPlan::default();
+    for (i, old_cfg) in old.iter().enumerate() {
+        match new.iter().position(|n| n.name == old_cfg.name) {
+            Some(j) => {
+                if **old_cfg == new[j] {
+                    plan.unchanged.push((i, j));
+                } else {
+                    plan.changed.push((i, j));
+                }
+            }
+            None => plan.removed.push(i),
+        }
+    }
+    for (j, new_cfg) in new.iter().enumerate() {
+        if !old.iter().any(|o| o.name == new_cfg.name) {
+            plan.added.push(j);
+        }
+    }
+    plan
 }
 
 /// What a single status poll of a live child concluded.
@@ -234,8 +337,15 @@ struct Running {
     pgid: Pid,
 }
 
-struct Supervised<'a> {
-    config: &'a ProcessConfig,
+struct Supervised {
+    /// Owned via `Arc`, not borrowed from the `configs` argument: the config is
+    /// shared out to several places (respawn in `tick()`, the health state, the
+    /// snapshot) and, since Этап 8, swapped wholesale on reload — a new
+    /// `Vec<ProcessConfig>` read on SIGHUP outlives the original slice, so a
+    /// borrow could not survive the swap. `Arc::clone` is cheap (no copy of the
+    /// command `Vec<String>`) and `ProcessConfig` is immutable after load:
+    /// shared ownership without interior mutability.
+    config: Arc<ProcessConfig>,
     /// `Some` ⇔ "killpg on `pgid` is safe"; cleared only after the leader is
     /// reaped.
     running: Option<Running>,
@@ -251,6 +361,11 @@ struct Supervised<'a> {
     next_restart_at: Option<Instant>,
     backoff: Backoff,
     done: bool,
+    /// Marked by a reload (Этап 8) whose new config no longer lists this name.
+    /// The entry stays in `procs` only until its leader is reaped; then
+    /// `prune_removed` drops it. Always `false` outside a reload, so every
+    /// pre-Этап 8 test keeps stable `procs` indices.
+    pending_removal: bool,
     /// Active health check (Этап 7); `Some` ⇔ the config has a
     /// `[process.health-check]` section. Intervals/threshold are *not* copied
     /// here — they are read from `config.health_check`, the single source of
@@ -307,7 +422,7 @@ fn poll_child(running: &mut Running, name: &str) -> PollOutcome {
 /// `child = Some` / `done = false` forever, so `run()` spun at 20 iterations a
 /// second flooding the log — the Этап 3 debt this closes. The supervisor's exit
 /// code is deliberately untouched: giving up shows in the log only.
-fn handle_poll_error(proc: &mut Supervised<'_>, err: &str) {
+fn handle_poll_error(proc: &mut Supervised, err: &str) {
     let exhausted = record_poll_error(&mut proc.poll_errors);
     tracing::error!(
         name = %proc.config.name,
@@ -381,8 +496,8 @@ struct StateWriter {
     next_write_at: Option<Instant>,
 }
 
-pub struct SupervisorLoop<'a, C: Clock> {
-    procs: Vec<Supervised<'a>>,
+pub struct SupervisorLoop<C: Clock> {
+    procs: Vec<Supervised>,
     clock: C,
     had_start_errors: bool,
     /// `None` unless a state file was requested. Opt-in so the tests that do
@@ -393,6 +508,11 @@ pub struct SupervisorLoop<'a, C: Clock> {
     /// `state_writer`, so tests that do not exercise the socket keep the plain
     /// construction and never touch it.
     control_server: Option<ControlServer>,
+    /// `run <config>`'s path, kept so SIGHUP can re-read it (Этап 8). Opt-in
+    /// like `state_writer`/`control_server`: without it SIGHUP is drained and
+    /// ignored, so tests that never call `with_config_reload` do not react to a
+    /// reload flag.
+    reload_path: Option<PathBuf>,
     /// Set once a shutdown signal has been received; suppresses restarts.
     /// Deliberately per-instance state rather than a global: tests can drive
     /// `begin_shutdown()` directly without touching process-wide signal state.
@@ -400,7 +520,7 @@ pub struct SupervisorLoop<'a, C: Clock> {
     shutdown_signal: Option<Signal>,
 }
 
-impl<'a, C: Clock> SupervisorLoop<'a, C> {
+impl<C: Clock> SupervisorLoop<C> {
     /// Spawns every configured process, best-effort: a process that fails to
     /// spawn is logged and skipped rather than aborting the whole startup —
     /// aborting would drop already-spawned `Child`s without waiting or
@@ -408,51 +528,16 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
     /// Skipped processes are not tracked, so indices into per-process
     /// accessors (`restart_count`, `is_done`, ...) refer to the subsequence
     /// of `configs` that spawned successfully, not `configs` itself.
-    pub fn new(configs: &'a [ProcessConfig], clock: C) -> Self {
+    pub fn new(configs: &[ProcessConfig], clock: C) -> Self {
         let mut procs = Vec::with_capacity(configs.len());
         let mut had_start_errors = false;
+        let now = clock.now();
         for config in configs {
-            match process::spawn(config) {
-                Ok(child) => {
-                    tracing::info!(name = %config.name, pid = child.id(), "process spawned");
-                    let pgid = Pid::from_raw(child.id() as i32);
-                    // Build the health state from the (already load-validated)
-                    // config. `probe()` cannot fail after `load()`, but in-process
-                    // tests construct `ProcessConfig` by hand, so a bad section is
-                    // logged and dropped (defensive, in the spirit of Этап 2's
-                    // best-effort startup) rather than panicking.
-                    let health = config
-                        .health_check
-                        .as_ref()
-                        .and_then(|hc| match hc.probe() {
-                            Ok(probe) => Some(HealthState {
-                                probe,
-                                schedule: None,
-                                consecutive_failures: 0,
-                            }),
-                            Err(err) => {
-                                tracing::error!(
-                                    name = %config.name,
-                                    error = %err,
-                                    "invalid health-check config; probing disabled for this process"
-                                );
-                                None
-                            }
-                        });
-                    procs.push(Supervised {
-                        config,
-                        running: Some(Running { child, pgid }),
-                        stop: StopPhase::Idle,
-                        intent: UserIntent::None,
-                        poll_errors: 0,
-                        restart_count: 0,
-                        started_at: clock.now(),
-                        next_restart_at: None,
-                        backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF, BACKOFF_FACTOR),
-                        done: false,
-                        health,
-                    });
-                }
+            // Own the config in an `Arc` (Этап 8): the shared construction of
+            // `new()` and the reload "added" path both go through
+            // `start_supervised`.
+            match start_supervised(Arc::new(config.clone()), now) {
+                Ok(proc) => procs.push(proc),
                 Err(err) => {
                     tracing::error!(name = %config.name, error = %err, "failed to spawn process");
                     had_start_errors = true;
@@ -465,6 +550,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
             had_start_errors,
             state_writer: None,
             control_server: None,
+            reload_path: None,
             shutting_down: false,
             shutdown_signal: None,
         }
@@ -485,6 +571,15 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
     /// [`with_state_file`](Self::with_state_file).
     pub fn with_control_server(mut self, server: ControlServer) -> Self {
         self.control_server = Some(server);
+        self
+    }
+
+    /// Re-reads `path` and applies the config diff on every SIGHUP while the
+    /// loop runs (Этап 8). Opt-in, like
+    /// [`with_control_server`](Self::with_control_server): without it a SIGHUP
+    /// is drained and ignored.
+    pub fn with_config_reload(mut self, path: PathBuf) -> Self {
+        self.reload_path = Some(path);
         self
     }
 
@@ -553,7 +648,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
 
     /// Uptime of the current instance, on the injected clock — so it is
     /// deterministic under `FakeClock`.
-    fn uptime_of(&self, proc: &Supervised<'a>) -> u64 {
+    fn uptime_of(&self, proc: &Supervised) -> u64 {
         self.clock
             .now()
             .saturating_duration_since(proc.started_at)
@@ -950,6 +1045,169 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
         }
     }
 
+    /// Handles one SIGHUP (Этап 8): re-reads the config file and applies the
+    /// diff. The whole reload is all-or-nothing — any load error (IO, parse,
+    /// validation) keeps the old config and every process untouched (user
+    /// decision). `pub` so e2e-shaped in-process tests can drive the
+    /// file-reading path; the pure diff+apply is [`apply_config`](Self::apply_config).
+    pub fn reload_config(&mut self) {
+        if self.shutting_down {
+            // Shutdown owns every restart and StopPhase; a reload wedged into
+            // it would race two owners. Ignore, like probes during shutdown.
+            tracing::debug!("SIGHUP during shutdown ignored");
+            return;
+        }
+        let Some(path) = self.reload_path.clone() else {
+            return;
+        };
+        tracing::info!(path = %path.display(), "SIGHUP: reloading config");
+        match crate::config::load(&path) {
+            Ok(config) => self.apply_config(config.process),
+            Err(err) => tracing::error!(
+                error = %err,
+                "config reload failed; keeping the current config and processes"
+            ),
+        }
+    }
+
+    /// Applies a newly loaded process list to the running supervisor: by-name
+    /// diff, then stop-and-prune the removed, force-restart the changed, spawn
+    /// the added, leave the unchanged strictly alone (Этап 8). Pure of file IO —
+    /// [`reload_config`](Self::reload_config) reads the file; in-process tests
+    /// call this directly. Precondition: names in `new` are unique (guaranteed
+    /// by `load()`).
+    pub fn apply_config(&mut self, new: Vec<ProcessConfig>) {
+        let now = self.clock.now();
+        let plan = {
+            let old: Vec<&ProcessConfig> = self.procs.iter().map(|p| &*p.config).collect();
+            plan_reload(&old, &new)
+        };
+
+        // unchanged: nothing — except a pending-removal resurrection. A prior
+        // reload marked this name for removal (TERM in flight) and this reload
+        // brought the name back; clear the mark and re-arm so the reaped
+        // outgoing instance is respawned rather than left a corpse.
+        for &(i, j) in &plan.unchanged {
+            if self.procs[i].pending_removal {
+                self.resurrect_removed(i, &new[j]);
+            }
+        }
+
+        // changed: swap the config in *before* signalling, then handle by
+        // state class.
+        for &(i, j) in &plan.changed {
+            if self.procs[i].pending_removal {
+                // Same resurrection case as above, but the config differs.
+                self.resurrect_removed(i, &new[j]);
+                continue;
+            }
+            let proc = &mut self.procs[i];
+            // Swap the Arc before the signal: respawn in `tick()` takes the new
+            // command/env/workdir, and `signal_terminate` takes the new
+            // `stop-grace-secs` (§2.1). Rebuild `health` so a changed
+            // `[process.health-check]` section is probed by the new probe — the
+            // schedule re-arms by generation but the probe itself is built once
+            // and would otherwise stay stale forever (§6.3).
+            proc.config = Arc::new(new[j].clone());
+            proc.health = build_health(&proc.config);
+            tracing::info!(name = %proc.config.name, "config changed; forcing restart");
+
+            if proc.done {
+                // DONE is terminal and never revived (§2.1); the new Arc is
+                // cosmetic.
+            } else if proc.running.is_some() && proc.stop == StopPhase::Idle {
+                // RUNNING → exactly an operator `restart`.
+                proc.intent = UserIntent::RestartPending;
+                signal_terminate(proc, now);
+            } else if proc.running.is_some() {
+                // STOPPING: a stop/restart is already in flight. A
+                // RestartPending in flight will respawn with the new config; a
+                // Stopped in flight stays stopped — operator wins.
+            } else if proc.intent == UserIntent::Stopped {
+                // USER_STOPPED: leave it stopped; a future `start` uses the new
+                // config (operator wins, §2.1).
+            } else {
+                // BACKOFF / transient gap: cut the wait short like
+                // `handle_command` on BACKOFF × restart. The backoff *step* is
+                // not reset — a config change speeds one restart, it does not
+                // declare the process healthy.
+                proc.next_restart_at = Some(now);
+            }
+        }
+
+        // removed: stop like an operator `stop`, then mark for pruning. A live
+        // child goes through TERM → grace → SIGKILL and is pruned only once
+        // reaped; a dead entry is pruned immediately below.
+        for &i in &plan.removed {
+            let proc = &mut self.procs[i];
+            proc.pending_removal = true;
+            proc.intent = UserIntent::Stopped;
+            // Invariant Stopped ⟹ next_restart_at == None.
+            proc.next_restart_at = None;
+            tracing::info!(name = %proc.config.name, "removed from config; stopping");
+            if proc.running.is_some() && proc.stop == StopPhase::Idle {
+                signal_terminate(proc, now);
+            }
+            // A stop already in flight is not re-signalled (same as STOPPING);
+            // an entry with no live child is pruned right after the loop.
+        }
+
+        // added: spawn now, like `new()`. Best-effort: a failed spawn is logged
+        // and skipped, and does not touch `had_start_errors` (the daemon's
+        // start-error exit code is not a reload concern).
+        for &j in &plan.added {
+            match start_supervised(Arc::new(new[j].clone()), now) {
+                Ok(proc) => {
+                    tracing::info!(name = %proc.config.name, "added by config reload");
+                    self.procs.push(proc);
+                }
+                Err(err) => tracing::error!(
+                    name = %new[j].name,
+                    error = %err,
+                    "failed to spawn process added by config reload"
+                ),
+            }
+        }
+
+        self.prune_removed();
+
+        if plan.changed.is_empty() && plan.removed.is_empty() && plan.added.is_empty() {
+            tracing::info!("config reload: no changes");
+        } else {
+            tracing::info!(
+                changed = plan.changed.len(),
+                removed = plan.removed.len(),
+                added = plan.added.len(),
+                unchanged = plan.unchanged.len(),
+                "config reload applied"
+            );
+        }
+    }
+
+    /// Turns a pending-removal entry that a later reload re-listed back into a
+    /// supervised one: clear the mark, swap in the new config and rebuild
+    /// health, and arm a respawn once the outgoing instance is reaped. An entry
+    /// marked `pending_removal` always has a live child (a dead one would have
+    /// been pruned), so `RestartPending` is the right intent.
+    fn resurrect_removed(&mut self, i: usize, new_cfg: &ProcessConfig) {
+        let proc = &mut self.procs[i];
+        proc.pending_removal = false;
+        proc.config = Arc::new(new_cfg.clone());
+        proc.health = build_health(&proc.config);
+        proc.intent = UserIntent::RestartPending;
+        tracing::info!(name = %proc.config.name, "re-added during removal; will respawn");
+    }
+
+    /// Drops every entry marked for removal whose leader is fully reaped (Этап
+    /// 8). Split out because it runs from two places: the end of `apply_config`
+    /// (entries with no live child are removable immediately) and the end of
+    /// `tick()` (a live child goes through TERM → grace → KILL first, and only
+    /// the reap makes its entry removable).
+    fn prune_removed(&mut self) {
+        self.procs
+            .retain(|p| !(p.pending_removal && p.running.is_none()));
+    }
+
     pub fn tick(&mut self) {
         for proc in &mut self.procs {
             if let Some(running) = proc.running.as_mut() {
@@ -1041,10 +1299,15 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                                 }
                                 UserIntent::Stopped => {
                                     // Not `done`: the daemon stays up so
-                                    // `start <name>` can revive it.
+                                    // `start <name>` can revive it (unless this
+                                    // entry is pending_removal, in which case
+                                    // prune_removed drops it at the end of this
+                                    // tick). Neutral attribution: the intent is
+                                    // armed by both an operator `stop` and a
+                                    // reload that removed the process (Этап 8).
                                     tracing::info!(
                                         name = %proc.config.name,
-                                        "stopped by operator"
+                                        "stopped; no respawn scheduled"
                                     );
                                 }
                                 UserIntent::None => {
@@ -1082,7 +1345,7 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                     .next_restart_at
                     .is_some_and(|at| self.clock.now() >= at)
             {
-                match process::spawn(proc.config) {
+                match process::spawn(&proc.config) {
                     Ok(child) => {
                         proc.restart_count += 1;
                         proc.started_at = self.clock.now();
@@ -1114,6 +1377,11 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                 }
             }
         }
+        // Drop any removed entry whose leader just got reaped this tick (Этап
+        // 8). A state transition, not a side channel, so it belongs in `tick()`
+        // rather than `run()`: a test driving `tick()` by hand must not be able
+        // to "forget" the prune and observe a ghost process.
+        self.prune_removed();
     }
 
     fn any_active(&self) -> bool {
@@ -1137,6 +1405,16 @@ impl<'a, C: Clock> SupervisorLoop<'a, C> {
                     );
                     self.escalate_to_kill();
                 }
+            }
+            // Reload is polled after the stop signal and before `any_active`
+            // (Этап 8): a SIGTERM delivered alongside SIGHUP wins — shutdown is
+            // handled above, and `reload_config` no-ops once `shutting_down`.
+            // Placing it before the liveness check lets a reload that adds
+            // processes to an all-`done` daemon record them before the loop
+            // decides to exit. The flag drains even without a `reload_path`, so
+            // a repeated SIGHUP never "sticks".
+            if crate::signal::take_reload_pending() {
+                self.reload_config();
             }
             if !self.any_active() {
                 break;
@@ -1267,7 +1545,7 @@ mod tests {
         let pgid = Pid::from_raw(child.id() as i32);
 
         let mut proc = Supervised {
-            config: &config,
+            config: Arc::new(config),
             running: Some(Running { child, pgid }),
             stop: StopPhase::Idle,
             intent: UserIntent::None,
@@ -1277,6 +1555,7 @@ mod tests {
             next_restart_at: None,
             backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF, BACKOFF_FACTOR),
             done: false,
+            pending_removal: false,
             health: None,
         };
 
@@ -1336,5 +1615,157 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(classify(fail), ExitOutcome::Failure);
+    }
+
+    // ---- Config reload diff (Этап 8): pure `plan_reload`, no processes ----
+
+    fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
+        ProcessConfig {
+            name: name.to_string(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            workdir: None,
+            env: None,
+            restart: crate::config::RestartPolicy::OnFailure,
+            stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
+            health_check: None,
+        }
+    }
+
+    /// Borrows a `[ProcessConfig]` as the `&[&ProcessConfig]` `plan_reload`
+    /// wants for its old side.
+    fn old_of(v: &[ProcessConfig]) -> Vec<&ProcessConfig> {
+        v.iter().collect()
+    }
+
+    #[test]
+    fn plan_reload_classifies_all_four_kinds() {
+        let old = [
+            cfg("a", &["/usr/bin/env", "true"]),
+            cfg("b", &["/usr/bin/env", "true"]),
+            cfg("c", &["/usr/bin/env", "true"]),
+        ];
+        let new = [
+            cfg("a", &["/usr/bin/env", "true"]),  // unchanged
+            cfg("b", &["/usr/bin/env", "false"]), // changed command
+            cfg("d", &["/usr/bin/env", "true"]),  // added
+        ];
+        let plan = plan_reload(&old_of(&old), &new);
+        assert_eq!(plan.unchanged, vec![(0, 0)]);
+        assert_eq!(plan.changed, vec![(1, 1)]);
+        assert_eq!(plan.removed, vec![2]);
+        assert_eq!(plan.added, vec![2]);
+    }
+
+    #[test]
+    fn plan_reload_notices_each_field() {
+        let base = cfg("web", &["/usr/bin/env", "true"]);
+
+        let mut command = base.clone();
+        command.command = vec!["/usr/bin/env".to_string(), "false".to_string()];
+
+        let mut env = base.clone();
+        env.env = Some(std::collections::BTreeMap::from([(
+            "K".to_string(),
+            "V".to_string(),
+        )]));
+
+        let mut workdir = base.clone();
+        workdir.workdir = Some(PathBuf::from("/srv"));
+
+        let mut restart = base.clone();
+        restart.restart = crate::config::RestartPolicy::Always;
+
+        let mut grace = base.clone();
+        grace.stop_grace_secs += 1;
+
+        let hc_add: crate::config::HealthCheckConfig =
+            toml::from_str("type = \"tcp\"\nport = 8080\n").unwrap();
+        let mut health_added = base.clone();
+        health_added.health_check = Some(hc_add.clone());
+
+        // Some → different Some (different port).
+        let hc_other: crate::config::HealthCheckConfig =
+            toml::from_str("type = \"tcp\"\nport = 9090\n").unwrap();
+        let mut health_from = base.clone();
+        health_from.health_check = Some(hc_add);
+        let mut health_to = base.clone();
+        health_to.health_check = Some(hc_other);
+
+        for (old_cfg, new_cfg) in [
+            (&base, &command),
+            (&base, &env),
+            (&base, &workdir),
+            (&base, &restart),
+            (&base, &grace),
+            (&base, &health_added),
+            (&health_from, &health_to),
+        ] {
+            let old = [old_cfg.clone()];
+            let new = [new_cfg.clone()];
+            let plan = plan_reload(&old_of(&old), &new);
+            assert_eq!(
+                plan.changed,
+                vec![(0, 0)],
+                "field change not seen as changed"
+            );
+            assert!(plan.unchanged.is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_reload_rename_is_remove_plus_add() {
+        let old = [cfg("old-name", &["/usr/bin/env", "true"])];
+        let new = [cfg("new-name", &["/usr/bin/env", "true"])];
+        let plan = plan_reload(&old_of(&old), &new);
+        assert_eq!(plan.removed, vec![0]);
+        assert_eq!(plan.added, vec![0]);
+        assert!(plan.changed.is_empty());
+        assert!(plan.unchanged.is_empty());
+    }
+
+    #[test]
+    fn plan_reload_reorder_is_unchanged() {
+        let old = [
+            cfg("a", &["/usr/bin/env", "true"]),
+            cfg("b", &["/usr/bin/env", "true"]),
+        ];
+        let new = [
+            cfg("b", &["/usr/bin/env", "true"]),
+            cfg("a", &["/usr/bin/env", "true"]),
+        ];
+        let plan = plan_reload(&old_of(&old), &new);
+        // Diff is by name, not position: a=(0,1), b=(1,0).
+        assert_eq!(plan.unchanged, vec![(0, 1), (1, 0)]);
+        assert!(plan.changed.is_empty());
+        assert!(plan.removed.is_empty());
+        assert!(plan.added.is_empty());
+    }
+
+    #[test]
+    fn plan_reload_empty_new_removes_everything() {
+        let old = [
+            cfg("a", &["/usr/bin/env", "true"]),
+            cfg("b", &["/usr/bin/env", "true"]),
+        ];
+        let new: [ProcessConfig; 0] = [];
+        let plan = plan_reload(&old_of(&old), &new);
+        assert_eq!(plan.removed, vec![0, 1]);
+        assert!(plan.added.is_empty());
+        assert!(plan.changed.is_empty());
+        assert!(plan.unchanged.is_empty());
+    }
+
+    #[test]
+    fn plan_reload_identical_is_all_unchanged() {
+        let old = [
+            cfg("a", &["/usr/bin/env", "true"]),
+            cfg("b", &["/usr/bin/env", "true"]),
+        ];
+        let new: Vec<ProcessConfig> = old.to_vec();
+        let plan = plan_reload(&old_of(&old), &new);
+        assert_eq!(plan.unchanged, vec![(0, 0), (1, 1)]);
+        assert!(plan.changed.is_empty());
+        assert!(plan.removed.is_empty());
+        assert!(plan.added.is_empty());
     }
 }
