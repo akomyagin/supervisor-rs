@@ -56,3 +56,20 @@ restart = "always"
 # timeout-secs = 5          # default 5
 # failure-threshold = 3     # default 3
 # start-period-secs = 0     # default 0; delay before the first probe
+
+# Optional capture of this process's stdout/stderr into files with size-based
+# rotation (Этап 9). Without this section stdio is inherited from the daemon,
+# exactly as before. With it, the configured stream goes through a pipe into the
+# supervisor and a dedicated OS thread appends it to the current file; once the
+# file reaches `max-size-bytes` the current file is moved to `<path>.1`, the old
+# `.1` to `.2`, …, and the oldest beyond `keep` is dropped. Rotation is
+# continuous (checked on every write), fully internal — no signals, no external
+# logrotate. At least one of stdout-path / stderr-path is required, the two must
+# differ, and all log paths across all processes must be unique. Output survives
+# the daemon's shutdown (unlike the state file and socket). Uncomment to try it:
+#
+# [process.log]
+# stdout-path = "/var/log/worker.stdout.log"   # at least one of the two paths
+# stderr-path = "/var/log/worker.stderr.log"   # separate files; both optional
+# max-size-bytes = 10485760                     # default 10 MiB (10 * 1024 * 1024)
+# keep = 5                                       # default 5; rotated .1 (newest) … .keep

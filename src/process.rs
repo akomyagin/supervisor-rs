@@ -10,8 +10,20 @@ use nix::errno::Errno;
 use nix::sys::signal::{killpg, Signal};
 use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+
+/// A freshly spawned process together with the supervisor-side read ends of its
+/// capture pipes (Этап 9). A field is `Some` exactly when the config's
+/// `[process.log]` section names a path for that stream; without the section
+/// both are `None` and stdio is inherited, exactly as before.
+#[derive(Debug)]
+pub struct Spawned {
+    pub child: Child,
+    pub stdout_capture: Option<OwnedFd>,
+    pub stderr_capture: Option<OwnedFd>,
+}
 
 #[derive(Debug)]
 pub enum SpawnError {
@@ -21,6 +33,11 @@ pub enum SpawnError {
     Spawn {
         name: String,
         source: std::io::Error,
+    },
+    /// Этап 9: creating a capture pipe failed before the process was spawned.
+    CapturePipe {
+        name: String,
+        source: nix::errno::Errno,
     },
 }
 
@@ -33,6 +50,12 @@ impl std::fmt::Display for SpawnError {
             SpawnError::Spawn { name, source } => {
                 write!(f, "process '{name}': failed to spawn: {source}")
             }
+            SpawnError::CapturePipe { name, source } => {
+                write!(
+                    f,
+                    "process '{name}': failed to create capture pipe: {source}"
+                )
+            }
         }
     }
 }
@@ -42,11 +65,12 @@ impl std::error::Error for SpawnError {
         match self {
             SpawnError::EmptyCommand { .. } => None,
             SpawnError::Spawn { source, .. } => Some(source),
+            SpawnError::CapturePipe { source, .. } => Some(source),
         }
     }
 }
 
-pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
+pub fn spawn(cfg: &ProcessConfig) -> Result<Spawned, SpawnError> {
     if cfg.command.is_empty() {
         return Err(SpawnError::EmptyCommand {
             name: cfg.name.clone(),
@@ -61,6 +85,52 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
     if let Some(map) = &cfg.env {
         // Adds to the inherited environment; deliberately no env_clear.
         cmd.envs(map);
+    }
+
+    // Capture pipes (Этап 9), wired *before* the pre_exec hook so the group
+    // mechanics of Этап 4 are untouched. A stream is captured only when the
+    // `[process.log]` section names a path for it; otherwise stdio stays
+    // inherited exactly as before.
+    //
+    // CRITICAL fd hygiene: the write end MOVES into `Stdio::from(write)` inside
+    // this local `cmd`. `Command::spawn()` dups the descriptor into the forked
+    // child, but the parent's own copy lives as long as its owner does — here
+    // that owner is `cmd`, a local dropped when `spawn()` returns. After the
+    // return only the child (and any grandchild that inherited the fd) holds the
+    // write end, so the reader thread eventually sees EOF. DO NOT hoist `cmd`
+    // or the `Stdio` out of `spawn()`, and never stash the `Stdio` anywhere: a
+    // leaked parent copy of the write end means the read end never reaches EOF,
+    // the reader thread blocks forever, and threads pile up on every respawn for
+    // the life of the daemon. `spawn_with_log_reaches_eof_after_child_exit`
+    // guards this regression.
+    //
+    // `pipe()` (not `pipe2(O_CLOEXEC)`) is deliberate: `pipe2` sits behind the
+    // `fs` feature of `nix` and `Cargo.toml` is frozen (plan §11). It is safe
+    // because the supervisor forks strictly single-threaded and sequentially —
+    // no foreign `fork()` can happen between `pipe()` and `cmd.spawn()`, and the
+    // write end is closed before the next spawn. The only cosmetic cost is that
+    // long-lived read ends leak into later-spawned children and exec-probes as
+    // spare fds, which does not affect EOF (that is determined by the write
+    // ends).
+    let mut stdout_capture = None;
+    let mut stderr_capture = None;
+    if let Some(log) = &cfg.log {
+        if log.stdout_path.is_some() {
+            let (read, write) = nix::unistd::pipe().map_err(|source| SpawnError::CapturePipe {
+                name: cfg.name.clone(),
+                source,
+            })?;
+            cmd.stdout(Stdio::from(write)); // write end MOVES in
+            stdout_capture = Some(read);
+        }
+        if log.stderr_path.is_some() {
+            let (read, write) = nix::unistd::pipe().map_err(|source| SpawnError::CapturePipe {
+                name: cfg.name.clone(),
+                source,
+            })?;
+            cmd.stderr(Stdio::from(write));
+            stderr_capture = Some(read);
+        }
     }
 
     // The child becomes a session (and hence process-group) leader, so its own
@@ -84,9 +154,14 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Child, SpawnError> {
         });
     }
 
-    cmd.spawn().map_err(|source| SpawnError::Spawn {
+    let child = cmd.spawn().map_err(|source| SpawnError::Spawn {
         name: cfg.name.clone(),
         source,
+    })?;
+    Ok(Spawned {
+        child,
+        stdout_capture,
+        stderr_capture,
     })
 }
 
@@ -163,7 +238,29 @@ mod tests {
             restart: RestartPolicy::default(),
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             health_check: None,
+            log: None,
         }
+    }
+
+    /// A config whose `[process.log]` section captures the given streams. The
+    /// paths are never opened here (no reader thread runs in these unit tests):
+    /// they only make `spawn()` wire the capture pipes.
+    fn cfg_with_log(
+        name: &str,
+        command: &[&str],
+        stdout_path: Option<&str>,
+        stderr_path: Option<&str>,
+    ) -> ProcessConfig {
+        use crate::config::{LogConfig, DEFAULT_LOG_KEEP, DEFAULT_LOG_MAX_SIZE_BYTES};
+        use std::num::{NonZeroU32, NonZeroU64};
+        let mut c = cfg(name, command);
+        c.log = Some(LogConfig {
+            stdout_path: stdout_path.map(std::path::PathBuf::from),
+            stderr_path: stderr_path.map(std::path::PathBuf::from),
+            max_size_bytes: NonZeroU64::new(DEFAULT_LOG_MAX_SIZE_BYTES).unwrap(),
+            keep: NonZeroU32::new(DEFAULT_LOG_KEEP).unwrap(),
+        });
+        c
     }
 
     #[test]
@@ -178,7 +275,7 @@ mod tests {
     #[test]
     fn spawned_child_leads_own_process_group() {
         let cfg = cfg("group", &["/usr/bin/env", "sleep", "60"]);
-        let mut child = spawn(&cfg).unwrap();
+        let mut child = spawn(&cfg).unwrap().child;
         let pid = Pid::from_raw(child.id() as i32);
 
         // setsid happens in the child after fork, so poll rather than assume it
@@ -201,7 +298,7 @@ mod tests {
     #[test]
     fn peek_exited_does_not_reap() {
         let cfg = cfg("quick", &["/usr/bin/env", "sh", "-c", "exit 0"]);
-        let mut child = spawn(&cfg).unwrap();
+        let mut child = spawn(&cfg).unwrap().child;
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !peek_exited(&child).unwrap() {
@@ -215,5 +312,63 @@ mod tests {
             child.try_wait().unwrap().is_some(),
             "peek consumed the status: the child was reaped behind Child's back"
         );
+    }
+
+    /// Opt-in contract: without a `[process.log]` section stdio is inherited and
+    /// neither capture fd exists.
+    #[test]
+    fn spawn_without_log_inherits_stdio() {
+        let cfg = cfg("plain", &["/usr/bin/env", "sh", "-c", "exit 0"]);
+        let mut spawned = spawn(&cfg).unwrap();
+        assert!(spawned.stdout_capture.is_none());
+        assert!(spawned.stderr_capture.is_none());
+        spawned.child.wait().unwrap();
+    }
+
+    /// The fd-hygiene test. Spawn a stub with stdout captured, read the pipe to
+    /// EOF *without the test ever touching the write end*, and check the bytes.
+    /// EOF must arrive on its own once the child exits — if `spawn()` leaked the
+    /// parent's copy of the write end, this `read` would block forever and the
+    /// test would hang loudly (that hang == an fd-hygiene regression, see §4 in
+    /// the plan / the comment in `spawn`). The log path is only there to make
+    /// `spawn()` build the pipe; no file is written and no reader thread runs.
+    #[test]
+    fn spawn_with_log_reaches_eof_after_child_exit() {
+        use std::io::Read;
+        let cfg = cfg_with_log(
+            "eof",
+            &["/usr/bin/env", "sh", "-c", "echo hi"],
+            Some("/tmp/unused-stdout.log"),
+            None,
+        );
+        let mut spawned = spawn(&cfg).unwrap();
+        let fd = spawned.stdout_capture.take().expect("stdout captured");
+        let mut pipe = std::fs::File::from(fd);
+        let mut buf = Vec::new();
+        // Blocks until EOF; EOF depends solely on every write end being closed.
+        pipe.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"hi\n");
+        spawned.child.wait().unwrap();
+    }
+
+    /// Capturing only stderr leaves stdout inherited: `stdout_capture` is None,
+    /// `stderr_capture` carries the stub's stderr.
+    #[test]
+    fn spawn_with_only_stderr_captures_only_stderr() {
+        use std::io::Read;
+        let cfg = cfg_with_log(
+            "err",
+            &["/usr/bin/env", "sh", "-c", "echo err 1>&2"],
+            None,
+            Some("/tmp/unused-stderr.log"),
+        );
+        let mut spawned = spawn(&cfg).unwrap();
+        assert!(spawned.stdout_capture.is_none());
+        let fd = spawned.stderr_capture.take().expect("stderr captured");
+        let mut pipe = std::fs::File::from(fd);
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"err\n");
+        spawned.child.wait().unwrap();
     }
 }
