@@ -31,7 +31,7 @@ fn sh(script: &str, restart: RestartPolicy) -> ProcessConfig {
 
 /// Ticks (with short real sleeps) until the process at `index` has exited and
 /// a restart is scheduled; returns the scheduled backoff delay.
-fn wait_for_restart_scheduled(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) -> Duration {
+fn wait_for_restart_scheduled(loop_: &mut SupervisorLoop<FakeClock>, index: usize) -> Duration {
     for _ in 0..500 {
         loop_.tick();
         if let Some(delay) = loop_.next_restart_delay(index) {
@@ -44,7 +44,7 @@ fn wait_for_restart_scheduled(loop_: &mut SupervisorLoop<'_, FakeClock>, index: 
 }
 
 /// Advances the fake clock past the scheduled delay and ticks to respawn.
-fn advance_and_respawn(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize, delay: Duration) {
+fn advance_and_respawn(loop_: &mut SupervisorLoop<FakeClock>, index: usize, delay: Duration) {
     let before = loop_.restart_count(index);
     loop_.clock().advance(delay);
     loop_.tick();

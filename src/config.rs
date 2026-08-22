@@ -36,7 +36,10 @@ pub struct Config {
     pub process: Vec<ProcessConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+/// `Clone` + `PartialEq` support the Этап 8 config reload: `Clone` lets `new()`
+/// wrap each config in an owning `Arc`, and `PartialEq` is the by-name diff's
+/// "changed / unchanged" test. `Eq` is not derived — only equality is needed.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProcessConfig {
     pub name: String,
     pub command: Vec<String>,
@@ -133,7 +136,11 @@ fn default_health_threshold() -> NonZeroU32 {
 /// serde/toml) so the error messages can name the offending field, consistent
 /// with the project's hand-rolled argv parsing. Where a *type* can validate for
 /// free it does: `NonZero*` rejects zeros, `IpAddr` rejects hostnames.
-#[derive(Debug, Deserialize)]
+///
+/// `Clone` + `PartialEq` (Этап 8): a changed `[process.health-check]` section
+/// is a config change like any other, so the reload diff compares whole
+/// sections by value.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HealthCheckConfig {
     #[serde(rename = "type")]
     pub kind: ProbeKind,
@@ -267,9 +274,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    /// A syntactically valid config whose health-check section fails
-    /// cross-field validation (Этап 7). Reported at load time with exit 1, the
-    /// existing "config error" class — no new exit code.
+    /// A syntactically valid config that fails a semantic, cross-field or
+    /// cross-process check: a health-check section that fails cross-field
+    /// validation (Этап 7), or a process name that is not unique (Этап 8, the
+    /// by-name reload diff needs a unique key). Reported at load time with
+    /// exit 1, the existing "config error" class — no new exit code.
     Invalid {
         path: PathBuf,
         /// Which process and what is wrong, e.g.
@@ -323,6 +332,20 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
+    // Process names must be unique: the Этап 8 reload diffs the old and new
+    // process lists by name, so a duplicate key would make the diff undefined
+    // (and the control socket already addresses only the first bearer of a
+    // name). Checked here, at load time, and thus also at first start — a
+    // tightening over Этапы 1–7, the deliberate price of a correct diff key.
+    let mut seen = std::collections::HashSet::new();
+    for proc in &config.process {
+        if !seen.insert(proc.name.as_str()) {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("duplicate process name \"{}\"", proc.name),
+            });
+        }
+    }
     // Cross-field validation of each health-check section: a syntactically valid
     // but semantically wrong probe (e.g. tcp without a port) is caught here, at
     // load time, rather than panicking in the runner.
@@ -837,5 +860,77 @@ type = "tcp"
         let text = err.to_string();
         assert!(text.contains(r#"process "web""#), "{text}");
         assert!(text.contains("port"), "{text}");
+    }
+
+    // ---- Config reload (Этап 8) ----
+
+    #[test]
+    fn rejects_duplicate_process_names() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "false"]
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"duplicate process name "web""#), "{text}");
+    }
+
+    /// Guards a future hand-written `PartialEq` that "forgets" a field — the
+    /// exact silent bug that would make the reload diff miss a change. Every
+    /// field of the base config is mutated one at a time and must break
+    /// equality.
+    #[test]
+    fn process_config_equality_notices_every_field() {
+        let base = ProcessConfig {
+            name: "web".to_string(),
+            command: vec!["/usr/bin/env".to_string(), "true".to_string()],
+            workdir: None,
+            env: None,
+            restart: RestartPolicy::OnFailure,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            health_check: None,
+        };
+        assert_eq!(base, base.clone());
+
+        let mut command = base.clone();
+        command.command = vec!["/usr/bin/env".to_string(), "false".to_string()];
+        assert_ne!(base, command);
+
+        let mut env = base.clone();
+        env.env = Some(BTreeMap::from([("K".to_string(), "V".to_string())]));
+        assert_ne!(base, env);
+
+        let mut workdir = base.clone();
+        workdir.workdir = Some(PathBuf::from("/srv"));
+        assert_ne!(base, workdir);
+
+        let mut restart = base.clone();
+        restart.restart = RestartPolicy::Always;
+        assert_ne!(base, restart);
+
+        let mut grace = base.clone();
+        grace.stop_grace_secs = base.stop_grace_secs + 1;
+        assert_ne!(base, grace);
+
+        let hc: HealthCheckConfig = toml::from_str(
+            r#"
+            type = "tcp"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        let mut health = base.clone();
+        health.health_check = Some(hc);
+        assert_ne!(base, health);
     }
 }

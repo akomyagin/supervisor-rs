@@ -114,19 +114,16 @@ fn is_alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH)
 }
 
-fn get_pid(loop_: &SupervisorLoop<'_, FakeClock>, index: usize) -> Option<i32> {
+fn get_pid(loop_: &SupervisorLoop<FakeClock>, index: usize) -> Option<i32> {
     loop_.snapshot().process[index].pid.map(|p| p as i32)
 }
 
-fn state_of(
-    loop_: &SupervisorLoop<'_, FakeClock>,
-    index: usize,
-) -> supervisor_rs::state::ProcState {
+fn state_of(loop_: &SupervisorLoop<FakeClock>, index: usize) -> supervisor_rs::state::ProcState {
     loop_.snapshot().process[index].state
 }
 
 /// Ticks with short real sleeps until the process at `index` is fully reaped.
-fn tick_until_reaped(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_reaped(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if get_pid(loop_, index).is_none() {
@@ -139,7 +136,7 @@ fn tick_until_reaped(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
 
 /// Ticks until the process at `index` is alive again with a *different* pid.
 fn tick_until_new_pid(
-    loop_: &mut SupervisorLoop<'_, FakeClock>,
+    loop_: &mut SupervisorLoop<FakeClock>,
     index: usize,
     old_pid: Option<i32>,
 ) -> i32 {
@@ -165,7 +162,7 @@ fn probe_count(path: &Path) -> usize {
 
 /// Ensures the process at `index` has a live pid, ticking once if needed. Used
 /// right after construction so the very first exec is observable.
-fn ensure_running(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) -> i32 {
+fn ensure_running(loop_: &mut SupervisorLoop<FakeClock>, index: usize) -> i32 {
     for _ in 0..100 {
         if let Some(pid) = get_pid(loop_, index) {
             return pid;

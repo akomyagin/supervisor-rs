@@ -88,14 +88,14 @@ fn is_alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH)
 }
 
-fn get_pid(loop_: &SupervisorLoop<'_, FakeClock>, index: usize) -> Option<i32> {
+fn get_pid(loop_: &SupervisorLoop<FakeClock>, index: usize) -> Option<i32> {
     loop_.snapshot().process[index].pid.map(|p| p as i32)
 }
 
 /// Ticks with short real sleeps until the process at `index` is fully reaped:
 /// no live pid in the snapshot, and (unless `expect_done`) not because the
 /// loop declared it `done`.
-fn tick_until_reaped(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_reaped(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if get_pid(loop_, index).is_none() {
@@ -109,7 +109,7 @@ fn tick_until_reaped(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
 /// Ticks until the process at `index` is alive again with a *different* pid
 /// than `old_pid`.
 fn tick_until_new_pid(
-    loop_: &mut SupervisorLoop<'_, FakeClock>,
+    loop_: &mut SupervisorLoop<FakeClock>,
     index: usize,
     old_pid: Option<i32>,
 ) -> i32 {
@@ -125,7 +125,7 @@ fn tick_until_new_pid(
     panic!("timed out waiting for a new instance to come up");
 }
 
-fn tick_until_restart_scheduled(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_restart_scheduled(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if loop_.next_restart_delay(index).is_some() {
@@ -137,7 +137,7 @@ fn tick_until_restart_scheduled(loop_: &mut SupervisorLoop<'_, FakeClock>, index
     panic!("timed out waiting for a scheduled restart");
 }
 
-fn tick_until_done(loop_: &mut SupervisorLoop<'_, FakeClock>, index: usize) {
+fn tick_until_done(loop_: &mut SupervisorLoop<FakeClock>, index: usize) {
     for _ in 0..500 {
         loop_.tick();
         if loop_.is_done(index) {
