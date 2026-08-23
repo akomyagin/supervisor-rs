@@ -23,6 +23,8 @@ fn cfg(name: &str, command: &[&str], restart: RestartPolicy) -> ProcessConfig {
         stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
         health_check: None,
         log: None,
+        rlimit: None,
+        cgroup: None,
     }
 }
 

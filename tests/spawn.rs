@@ -16,13 +16,15 @@ fn cfg(name: &str, command: &[&str]) -> ProcessConfig {
         stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
         health_check: None,
         log: None,
+        rlimit: None,
+        cgroup: None,
     }
 }
 
 #[test]
 fn spawns_short_lived_process_and_waits_exit_zero() {
     let cfg = cfg("true", &["/usr/bin/env", "true"]);
-    let mut child = process::spawn(&cfg).unwrap().child;
+    let mut child = process::spawn(&cfg, None).unwrap().child;
     let status = child.wait().unwrap();
     assert!(status.success());
 }
@@ -30,7 +32,7 @@ fn spawns_short_lived_process_and_waits_exit_zero() {
 #[test]
 fn spawns_failing_process_and_observes_nonzero_exit() {
     let cfg = cfg("false", &["/usr/bin/env", "false"]);
-    let mut child = process::spawn(&cfg).unwrap().child;
+    let mut child = process::spawn(&cfg, None).unwrap().child;
     let status = child.wait().unwrap();
     assert!(!status.success());
     assert_eq!(status.code(), Some(1));
@@ -43,7 +45,7 @@ fn spawn_applies_env() {
         &["/usr/bin/env", "sh", "-c", "test \"$SUP_TEST\" = ok"],
     );
     config.env = Some(BTreeMap::from([("SUP_TEST".to_string(), "ok".to_string())]));
-    let mut child = process::spawn(&config).unwrap().child;
+    let mut child = process::spawn(&config, None).unwrap().child;
     let status = child.wait().unwrap();
     assert!(status.success());
 }

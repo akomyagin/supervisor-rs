@@ -24,6 +24,7 @@ use supervisor_rs::cli::{self, Command};
 use supervisor_rs::clock::SystemClock;
 use supervisor_rs::config;
 use supervisor_rs::control::{self, ControlServer, Request, Response};
+use supervisor_rs::limits;
 use supervisor_rs::signal;
 use supervisor_rs::state::{self, ReadError};
 use supervisor_rs::supervise::SupervisorLoop;
@@ -54,7 +55,8 @@ fn main() -> ExitCode {
             config,
             state_file,
             control_socket,
-        }) => run(&config, state_file, control_socket),
+            cgroup_root,
+        }) => run(&config, state_file, control_socket, cgroup_root),
         Ok(Command::Status { state_file }) => status(state_file),
         Ok(Command::Control {
             request,
@@ -72,6 +74,7 @@ fn run(
     config_path: &std::path::Path,
     state_file: Option<PathBuf>,
     control_socket: Option<PathBuf>,
+    cgroup_root: Option<PathBuf>,
 ) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -111,13 +114,21 @@ fn run(
     let state_path = state_file.unwrap_or_else(state::default_path);
     tracing::info!(path = %state_path.display(), "publishing state to");
 
+    // Resolve the cgroup root always (Этап 10): creating anything on disk is
+    // lazy — with no [process.cgroup] section the daemon never touches cgroupfs.
+    // No pre-flight check of the root: a setup failure is per-process, at spawn
+    // time (the honest "process does not start" policy of §2.1).
+    let cgroup_root = cgroup_root.unwrap_or_else(limits::default_root);
+    tracing::info!(path = %cgroup_root.display(), "cgroup root");
+
     // A spawn failure means not everything ran as configured — reflect that in
     // the exit code rather than reporting a misleading SUCCESS, even though
     // processes that did spawn are still supervised below.
-    let mut loop_ = SupervisorLoop::new(&config.process, SystemClock)
-        .with_state_file(state_path)
-        .with_control_server(server)
-        .with_config_reload(config_path.to_path_buf());
+    let mut loop_ =
+        SupervisorLoop::new_with_cgroup_root(&config.process, SystemClock, Some(cgroup_root))
+            .with_state_file(state_path)
+            .with_control_server(server)
+            .with_config_reload(config_path.to_path_buf());
     let had_start_errors = loop_.had_start_errors();
     loop_.run();
 
