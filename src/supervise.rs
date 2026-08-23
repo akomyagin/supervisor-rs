@@ -19,6 +19,7 @@ use crate::clock::Clock;
 use crate::config::{ExitOutcome, HealthProbe, ProcessConfig};
 use crate::control::{ControlServer, Request, Response};
 use crate::health;
+use crate::limits;
 use crate::logs;
 use crate::process;
 use crate::state::{self, ProcState, ProcessState, StateSnapshot, STATE_VERSION};
@@ -237,17 +238,19 @@ fn build_health(config: &ProcessConfig) -> Option<HealthState> {
 /// full pipe buffer), so the child is torn down first, then the error returns.
 fn start_instance(
     config: &ProcessConfig,
-) -> Result<(Running, Option<LogState>), process::SpawnError> {
+    cgroup_root: Option<&std::path::Path>,
+) -> Result<(Running, Option<LogState>, Option<limits::ProcessCgroup>), process::SpawnError> {
     let process::Spawned {
         child,
         stdout_capture,
         stderr_capture,
-    } = process::spawn(config)?;
+        cgroup,
+    } = process::spawn(config, cgroup_root)?;
     let pgid = Pid::from_raw(child.id() as i32);
 
     // No capture configured: the common path, no threads, no LogState.
     if stdout_capture.is_none() && stderr_capture.is_none() {
-        return Ok((Running { child, pgid }, None));
+        return Ok((Running { child, pgid }, None, cgroup));
     }
 
     // `Some(fd)` ⟹ the section named a path for that stream (spawn only builds a
@@ -311,12 +314,16 @@ fn start_instance(
         None => None,
     };
 
+    // On the reader-thread error paths above, `cgroup` (if any) is a local that
+    // is dropped at the early `return Err(...)`, so its now-empty directory is
+    // removed best-effort — no explicit cleanup needed (Этап 10, plan §7 p.3).
     Ok((
         Running { child, pgid },
         Some(LogState {
             stdout: stdout_handle,
             stderr: stderr_handle,
         }),
+        cgroup,
     ))
 }
 
@@ -339,9 +346,13 @@ fn kill_and_reap_instance(mut child: std::process::Child, pgid: Pid, name: &str)
 fn start_supervised(
     config: Arc<ProcessConfig>,
     now: Instant,
+    cgroup_root: Option<&std::path::Path>,
 ) -> Result<Supervised, process::SpawnError> {
-    let (running, log) = start_instance(&config)?;
+    let (running, log, cgroup) = start_instance(&config, cgroup_root)?;
     tracing::info!(name = %config.name, pid = running.child.id(), "process spawned");
+    if let Some(cg) = &cgroup {
+        tracing::info!(name = %config.name, cgroup = %cg.path().display(), "cgroup configured");
+    }
     let health = build_health(&config);
     Ok(Supervised {
         config,
@@ -357,6 +368,7 @@ fn start_supervised(
         pending_removal: false,
         health,
         log,
+        cgroup,
     })
 }
 
@@ -548,6 +560,13 @@ struct Supervised {
     /// instance was spawned with at least one capture pipe. Armed at (re)spawn
     /// in `start_instance`, joined and taken at reap in `join_log_readers`.
     log: Option<LogState>,
+    /// The cgroup of the current instance (Этап 10); `Some` ⇔ the config has a
+    /// `[process.cgroup]` section. Instance-derived, like `log`: replaced on
+    /// respawn (assigning the new handle drops the old one, whose rmdir is a
+    /// no-op EBUSY since the new instance already lives in the same directory),
+    /// and dropped for good when the entry is pruned by a reload or at daemon
+    /// exit — best-effort removing the directory.
+    cgroup: Option<limits::ProcessCgroup>,
 }
 
 /// Polls a live child and, if it has exited, sweeps its process group with
@@ -699,6 +718,12 @@ pub struct SupervisorLoop<C: Clock> {
     /// `begin_shutdown()` directly without touching process-wide signal state.
     shutting_down: bool,
     shutdown_signal: Option<Signal>,
+    /// Root of the per-process cgroup subtree (Этап 10); threaded down to
+    /// `process::spawn` for every process that has a `[process.cgroup]` section.
+    /// `None` ⇔ no root was resolved (the plain `new` path used by most tests):
+    /// a process with a cgroup section then fails to spawn (the runtime cannot
+    /// provide the isolation the config demands). main.rs always resolves a root.
+    cgroup_root: Option<PathBuf>,
 }
 
 impl<C: Clock> SupervisorLoop<C> {
@@ -710,6 +735,18 @@ impl<C: Clock> SupervisorLoop<C> {
     /// accessors (`restart_count`, `is_done`, ...) refer to the subsequence
     /// of `configs` that spawned successfully, not `configs` itself.
     pub fn new(configs: &[ProcessConfig], clock: C) -> Self {
+        Self::new_with_cgroup_root(configs, clock, None)
+    }
+
+    /// The full constructor (Этап 10): like [`new`](Self::new) but also carries a
+    /// cgroup root threaded down to `process::spawn`. `new` is a thin wrapper
+    /// passing `None`, so every existing test and call keeps the two-argument
+    /// form untouched; main.rs calls this one with the resolved root.
+    pub fn new_with_cgroup_root(
+        configs: &[ProcessConfig],
+        clock: C,
+        cgroup_root: Option<PathBuf>,
+    ) -> Self {
         let mut procs = Vec::with_capacity(configs.len());
         let mut had_start_errors = false;
         let now = clock.now();
@@ -717,7 +754,7 @@ impl<C: Clock> SupervisorLoop<C> {
             // Own the config in an `Arc` (Этап 8): the shared construction of
             // `new()` and the reload "added" path both go through
             // `start_supervised`.
-            match start_supervised(Arc::new(config.clone()), now) {
+            match start_supervised(Arc::new(config.clone()), now, cgroup_root.as_deref()) {
                 Ok(proc) => procs.push(proc),
                 Err(err) => {
                     tracing::error!(name = %config.name, error = %err, "failed to spawn process");
@@ -734,6 +771,7 @@ impl<C: Clock> SupervisorLoop<C> {
             reload_path: None,
             shutting_down: false,
             shutdown_signal: None,
+            cgroup_root,
         }
     }
 
@@ -1337,7 +1375,7 @@ impl<C: Clock> SupervisorLoop<C> {
         // and skipped, and does not touch `had_start_errors` (the daemon's
         // start-error exit code is not a reload concern).
         for &j in &plan.added {
-            match start_supervised(Arc::new(new[j].clone()), now) {
+            match start_supervised(Arc::new(new[j].clone()), now, self.cgroup_root.as_deref()) {
                 Ok(proc) => {
                     tracing::info!(name = %proc.config.name, "added by config reload");
                     self.procs.push(proc);
@@ -1534,8 +1572,8 @@ impl<C: Clock> SupervisorLoop<C> {
                     .next_restart_at
                     .is_some_and(|at| self.clock.now() >= at)
             {
-                match start_instance(&proc.config) {
-                    Ok((running, log_state)) => {
+                match start_instance(&proc.config, self.cgroup_root.as_deref()) {
+                    Ok((running, log_state, cgroup)) => {
                         proc.restart_count += 1;
                         proc.started_at = self.clock.now();
                         proc.next_restart_at = None;
@@ -1549,6 +1587,10 @@ impl<C: Clock> SupervisorLoop<C> {
                         proc.stop = StopPhase::Idle;
                         proc.running = Some(running);
                         proc.log = log_state;
+                        // Replace the cgroup handle: assigning drops the old one,
+                        // whose rmdir is a no-op EBUSY since the new instance is
+                        // already attached to the same directory (Этап 10, §7 p.6).
+                        proc.cgroup = cgroup;
                     }
                     Err(err) => {
                         // Apply the same backoff as a crashing process would get,
@@ -1631,6 +1673,18 @@ impl<C: Clock> SupervisorLoop<C> {
         }
         if let Some(server) = &self.control_server {
             server.cleanup();
+        }
+        // cgroup directories are a runtime artifact (the class of the state file
+        // and socket, not the log files): removed on a clean exit (Этап 10). Every
+        // child is reaped by this point, so each per-process directory is empty
+        // and its `Drop` removes it — except where a leader's escaped setsid-orphan
+        // still lives inside (EBUSY → debug-log, kept). Take the handles first so
+        // per-process dirs go before the root, then remove the root best-effort.
+        if let Some(root) = &self.cgroup_root {
+            for proc in &mut self.procs {
+                drop(proc.cgroup.take());
+            }
+            limits::remove_root_best_effort(root);
         }
     }
 
@@ -1729,8 +1783,10 @@ mod tests {
             stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
             health_check: None,
             log: None,
+            rlimit: None,
+            cgroup: None,
         };
-        let child = process::spawn(&config).unwrap().child;
+        let child = process::spawn(&config, None).unwrap().child;
         let pid = Pid::from_raw(child.id() as i32);
         let pgid = Pid::from_raw(child.id() as i32);
 
@@ -1748,6 +1804,7 @@ mod tests {
             pending_removal: false,
             health: None,
             log: None,
+            cgroup: None,
         };
 
         for i in 1..MAX_CONSECUTIVE_POLL_ERRORS {
@@ -1820,6 +1877,8 @@ mod tests {
             stop_grace_secs: crate::config::DEFAULT_STOP_GRACE_SECS,
             health_check: None,
             log: None,
+            rlimit: None,
+            cgroup: None,
         }
     }
 
@@ -1896,6 +1955,30 @@ mod tests {
         let mut log_to = base.clone();
         log_to.log = Some(log_other);
 
+        // Rlimit section: None → Some, and Some → different Some (Этап 10).
+        let rl_add: crate::config::RlimitConfig = toml::from_str("nofile = 1024").unwrap();
+        let mut rlimit_added = base.clone();
+        rlimit_added.rlimit = Some(rl_add);
+
+        let rl_other: crate::config::RlimitConfig = toml::from_str("nofile = 2048").unwrap();
+        let mut rlimit_from = base.clone();
+        rlimit_from.rlimit = Some(rl_add);
+        let mut rlimit_to = base.clone();
+        rlimit_to.rlimit = Some(rl_other);
+
+        // Cgroup section: None → Some, and Some → different Some (Этап 10).
+        let cg_add: crate::config::CgroupConfig =
+            toml::from_str("memory-max-bytes = 1048576").unwrap();
+        let mut cgroup_added = base.clone();
+        cgroup_added.cgroup = Some(cg_add);
+
+        let cg_other: crate::config::CgroupConfig =
+            toml::from_str("memory-max-bytes = 2097152").unwrap();
+        let mut cgroup_from = base.clone();
+        cgroup_from.cgroup = Some(cg_add);
+        let mut cgroup_to = base.clone();
+        cgroup_to.cgroup = Some(cg_other);
+
         for (old_cfg, new_cfg) in [
             (&base, &command),
             (&base, &env),
@@ -1906,6 +1989,10 @@ mod tests {
             (&health_from, &health_to),
             (&base, &log_added),
             (&log_from, &log_to),
+            (&base, &rlimit_added),
+            (&rlimit_from, &rlimit_to),
+            (&base, &cgroup_added),
+            (&cgroup_from, &cgroup_to),
         ] {
             let old = [old_cfg.clone()];
             let new = [new_cfg.clone()];

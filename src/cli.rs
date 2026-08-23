@@ -25,6 +25,10 @@ pub enum Command {
         config: PathBuf,
         state_file: Option<PathBuf>,
         control_socket: Option<PathBuf>,
+        /// Root of the per-process cgroup subtree (Этап 10). `None` ⇒ main.rs
+        /// resolves the default `limits::DEFAULT_CGROUP_ROOT`. Applicable only to
+        /// `run`, by the `--state-file` precedent.
+        cgroup_root: Option<PathBuf>,
     },
     Status {
         state_file: Option<PathBuf>,
@@ -78,6 +82,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     let mut positional: Vec<&str> = Vec::new();
     let mut state_file: Option<PathBuf> = None;
     let mut control_socket: Option<PathBuf> = None;
+    let mut cgroup_root: Option<PathBuf> = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -93,6 +98,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                     .next()
                     .ok_or_else(|| err("--control-socket requires a path"))?;
                 control_socket = Some(PathBuf::from(value));
+            }
+            "--cgroup-root" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| err("--cgroup-root requires a path"))?;
+                // Last one wins on repetition — the `--state-file` precedent.
+                cgroup_root = Some(PathBuf::from(value));
             }
             flag if flag.starts_with("--") => {
                 return Err(err(format!("unknown option '{flag}'")));
@@ -117,6 +129,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 config: PathBuf::from(config),
                 state_file,
                 control_socket,
+                cgroup_root,
             }),
             [] => Err(err("'run' requires a <config-path>")),
             _ => Err(err(format!(
@@ -129,6 +142,9 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 if control_socket.is_some() {
                     return Err(err("'status' does not take --control-socket"));
                 }
+                if cgroup_root.is_some() {
+                    return Err(err("'status' does not take --cgroup-root"));
+                }
                 Ok(Command::Status { state_file })
             }
             [extra, ..] => Err(err(format!(
@@ -138,6 +154,9 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         verb @ ("start" | "stop" | "restart") => {
             if state_file.is_some() {
                 return Err(err(format!("'{verb}' does not take --state-file")));
+            }
+            if cgroup_root.is_some() {
+                return Err(err(format!("'{verb}' does not take --cgroup-root")));
             }
             match operands {
                 [name] => {
@@ -183,7 +202,7 @@ pub fn usage() -> &'static str {
 supervisor-rs — a minimal process supervisor (mini-systemd) for Unix
 
 Usage:
-  supervisor-rs run <config-path> [--state-file <path>] [--control-socket <path>]
+  supervisor-rs run <config-path> [--state-file <path>] [--control-socket <path>] [--cgroup-root <path>]
   supervisor-rs status [--state-file <path>]
   supervisor-rs start <name> [--control-socket <path>]
   supervisor-rs stop <name> [--control-socket <path>]
@@ -206,6 +225,10 @@ Options:
                            $XDG_RUNTIME_DIR/supervisor-rs/control.sock, or
                            /tmp/supervisor-rs-<uid>/control.sock when
                            XDG_RUNTIME_DIR is not set.
+  --cgroup-root <path>     Root of the per-process cgroup v2 subtree used for
+                           [process.cgroup] limits (run only). Requires a
+                           delegated, writable cgroup v2 subtree. Default:
+                           /sys/fs/cgroup/supervisor-rs.
   -h, --help               Print this help.
 "
 }
@@ -226,6 +249,7 @@ mod tests {
                 config: PathBuf::from("/etc/sup.toml"),
                 state_file: None,
                 control_socket: None,
+                cgroup_root: None,
             }
         );
     }
@@ -244,6 +268,7 @@ mod tests {
                 config: PathBuf::from("/etc/sup.toml"),
                 state_file: Some(PathBuf::from("/tmp/s.toml")),
                 control_socket: None,
+                cgroup_root: None,
             }
         );
     }
@@ -262,6 +287,7 @@ mod tests {
                 config: PathBuf::from("/etc/sup.toml"),
                 state_file: None,
                 control_socket: Some(PathBuf::from("/tmp/c.sock")),
+                cgroup_root: None,
             }
         );
     }

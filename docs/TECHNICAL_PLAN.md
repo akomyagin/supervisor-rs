@@ -34,8 +34,9 @@ src/
 ├── control.rs   # control-socket: протокол, ControlServer, клиент (Этап 6)
 ├── health.rs    # exec/tcp/http пробы: run_probe(), ProbeError (Этап 7)
 ├── logs.rs      # RotatingFile + поток-читатель pipe: захват stdout/stderr, ротация по размеру (Этап 9)
+├── limits.rs    # cgroup v2: setup/attach/Drop поддерева, cpu.max/memory.max (Этап 10)
 ├── supervise.rs # SupervisorLoop: monitor-loop, restart policy, backoff, снапшот, handle_command
-└── process.rs   # spawn / teardown, process groups, waitpid
+└── process.rs   # spawn / teardown, process groups, waitpid, setrlimit в pre_exec (Этап 10)
 ```
 
 Логика намеренно разделена: `config` — чистый парсинг без сайд-эффектов (легко
@@ -56,7 +57,11 @@ src/
 Этапе 9 по тому же принципу и так же ничего не знает о `SupervisorLoop` и
 `Clock`: чистое ядро ротации (`RotatingFile`, юнит-тестируемое на tempdir без
 процессов и потоков) плюс функция запуска потока-читателя pipe. Часов у него нет
-вообще — ротация есть функция размера, не времени.
+вообще — ротация есть функция размера, не времени. `limits.rs` добавлен в Этапе
+10 и по той же линии не знает о `SupervisorLoop`/`Clock`: чистая файловая
+механика cgroupfs (`setup`/`attach`/`Drop`/`remove_root_best_effort`),
+юнит-тестируемая на tempdir как «фейковом cgroupfs» без привилегий (`std::fs`
+создаёт обычные файлы там, где на настоящем cgroupfs их подставляет ядро).
 
 ## Разбивка по Этапам
 
@@ -1072,10 +1077,156 @@ per-process `info!` на removed/changed/added, итоговая строка с
   `restarted_instance_appends_to_same_file` (append + счёт из metadata),
   `changed_log_config_forces_restart` (reload без правок reload-кода).
 
+### Этап 10 — Resource limits (setrlimit + cgroup v2, готово)
+
+Этап 10 добавляет два **опциональных** механизма лимитов на процесс, оба
+opt-in (без секций поведение прежнее до байта, прецедент health/log):
+
+- **`[process.rlimit]`** — per-process `setrlimit(2)` (`nofile`/`as-bytes`/
+  `cpu-secs`), ставится в существующем `pre_exec`-хуке рядом с `setsid()`,
+  наследуется всеми потомками. `soft = hard = значение`. Хотя бы один ключ
+  обязателен.
+- **`[process.cgroup]`** — cgroup v2 лимиты на **всё дерево** (`cpu-max-percent`,
+  `memory-max-bytes`): супервизор создаёт `<cgroup-root>/<name>`, пишет
+  `cpu.max`/`memory.max` и после `spawn()` записывает pid ребёнка в
+  `cgroup.procs`. Корень переопределяется флагом `--cgroup-root` (default
+  `/sys/fs/cgroup/supervisor-rs`, прецедент `--state-file`).
+
+**Решения пользователя (приняты, не пересматривать):**
+
+1. **cgroup — ТОЛЬКО для лимитов CPU/памяти, НЕ для teardown.** Механика Этапа 4
+   (`killpg`, peek → sweep → reap) не изменена ни на строку: `cgroup.kill` не
+   вводится и не заменяет `killpg`. Известное ограничение «сбежавший из
+   process-группы собственным `setsid` орфан недостижим для `killpg`» остаётся
+   как есть (он остаётся в cgroup и был бы достижим для `cgroup.kill` — но это
+   осознанно отклонено, кандидат POST_MVP). Следствие: самый зрелый код проекта
+   (teardown) в этом этапе не тронут.
+2. **Две раздельные секции**, не одна `[process.limits]`: механизмы различаются
+   по всем осям (охват процесс+потомки vs всё дерево через ядро; место
+   применения `pre_exec` vs файлы cgroupfs из родителя; требования к среде
+   rlimit работает везде и только вниз, cgroup требует делегированного v2; режим
+   отказа). Слитная секция размыла бы «какой ключ куда» и валидацию «хотя бы
+   один ключ».
+3. **`setrlimit` — в `pre_exec`** (тот же async-signal-safe контекст, что
+   `setsid`: простой syscall, без аллокаций/логов/мьютексов). `RlimitConfig` —
+   `Copy`, замыкание владеет целыми числами и не аллоцирует — инвариант,
+   удерживающий хук fork-safe рядом с живыми потоками-читателями Этапа 9.
+4. **Запись pid в `cgroup.procs` — в родителе, сразу после `cmd.spawn()`**, НЕ в
+   `pre_exec`: форматирование pid — аллокация, запрещённая в форкнутом ребёнке
+   при живых потоках родителя (тот же класс риска, что в Этапе 9). Цена —
+   короткое окно «exec → attach», где процесс уже исполняется вне cgroup;
+   fork в этом окне остаётся вне cgroup навсегда (известное ограничение).
+   Атомарная альтернатива `clone3(CLONE_INTO_CGROUP)` (kernel 5.7+, сырой
+   syscall) отклонена как непропорциональная сложность для учебного проекта.
+5. **Политика «cgroup setup failed → процесс не стартует».** Любая ошибка
+   цепочки mkdir root → включение контроллеров → mkdir `<name>` → запись лимитов
+   → attach pid — это `SpawnError` этого процесса (`error!`-лог, процесс не
+   трекается, соседи целы, `had_start_errors` → exit 1). Не деградировать молча
+   в «без лимитов»: оператор попросил изоляцию — соврать «работает» хуже, чем не
+   стартовать (прецедент Этапа 9: инстанс проваливается, если не создался
+   поток-читатель). На attach-ошибке уже спавнутый ребёнок SIGKILL-ится по pid
+   (`child.kill()`, не `signal_group`: `setsid` мог ещё не выполниться) и
+   реапится (`child.wait()`, прецедент exec-пробы Этапа 7) — зомби не утекает.
+6. **Ленивое включение контроллеров.** При настройке процесса в
+   `<root>/cgroup.subtree_control` дописывается только нужное (`+cpu` при
+   `cpu-max-percent`, `+memory` при `memory-max-bytes`). Требование «предок
+   root'а уже делегировал контроллеры» (его `cgroup.subtree_control`) — вне
+   контроля супервизора; его нарушение проявляется как ошибка записи → политика
+   выше. `cpu-max-percent` — один knob (процент одного CPU, period фиксирован
+   100 ms → quota = percent × 1000 µs), а не сырые quota/period: не протекать
+   абстракцией ядра в TOML.
+7. **cgroup-директории — служебный артефакт рантайма** (класс state-файла и
+   сокета, НЕ лог-файлов): убираются при штатном выходе демона. Механика —
+   **`Drop` у `ProcessCgroup`** (best-effort `rmdir`, `debug!` на неудачу): один
+   механизм структурно покрывает все пути — эпилог `run()` (явный `take()` перед
+   `rmdir` root), prune удалённого reload'ом процесса (запись дропается → dir
+   убирается), замену хендла при респавне (новый инстанс уже attach-нут → `rmdir`
+   старого пути даёт EBUSY → no-op). Демон, убитый SIGKILL, оставляет директории
+   (класс осиротевшего state-файла); следующий старт переиспользует их (mkdir
+   EEXIST — ок, лимиты перезаписываются). Респавн/reload с изменённой секцией
+   применяют новые лимиты бесплатно — рестарт идёт общим spawn-путём.
+8. **Никаких `#[cfg(target_os)]`-веток.** `setrlimit` — POSIX (nix даёт
+   `RLIMIT_NOFILE`/`AS`/`CPU` на всех Unix), cgroup-код — это `std::fs` по путям:
+   компилируется везде, а на не-Linux (или Linux без cgroup v2) настройка cgroup
+   падает в рантайме ошибкой IO → та же честная политика «процесс не стартует».
+   POST_MVP предполагал «деградацию на не-Linux», но существующий error-path уже
+   даёт честную **рантайм**овую деградацию без отдельной ветки, а молчаливый
+   no-op противоречил бы «не врать оператору». Проект и так тестируется только на
+   Linux.
+
+**Схема state-файла НЕ изменена (`version` остаётся 1):** лимиты и cgroup-путь в
+снапшот и `status` не попадают — они наблюдаемы самим cgroupfs
+(`cat <root>/<name>/memory.max`) и `/proc/<pid>/limits`. `handle_command`/
+control-socket — ноль правок: лимиты не команда сокета.
+
+**Reload Этапа 8 — ноль правок логики:** derived `Clone`/`PartialEq` на новых
+полях `ProcessConfig` заставляют `plan_reload` видеть изменение секций как
+«конфиг изменился» → рестарт существующей веткой `changed`. Единственное касание
+reload — третий аргумент `cgroup_root` у вызова `start_supervised` в added-пути
+(механическое протаскивание сигнатуры). Подтверждено тестом
+`changed_rlimit_forces_restart_with_new_limits`, не декларацией.
+
+**Гейт-паттерн тестов cgroup — первый класс conditionally-skipped в проекте.**
+Любой тест, реально создающий cgroup-поддерево, сначала спрашивает
+`cgroup_root_for_test`, может ли он это здесь (та же цепочка mkdir/
+subtree_control, что у `limits::setup` — проверяется **действие**, не `test -w`),
+и **громко пропускается** (`eprintln!("CGROUP-TEST SKIPPED…")`), если нет — не
+падает, не виснет. `SUPERVISOR_RS_REQUIRE_CGROUP_TESTS=1` превращает пропуск в
+панику (для привилегированного CI: ошибочный skip там = красный прогон). В
+непривилегированной песочнице `cargo test` полностью зелёный; rlimit-часть и
+негативные cgroup-пути привилегий не требуют.
+
+**Наблюдение rlimit детерминировано** через `ulimit`-builtin самого стаба
+(`sh -c 'ulimit -n > marker'`), без привилегий и умирающих процессов; `ulimit -v`
+— в КиБ (конфиг as-bytes брать кратным 1024). Enforcement RLIMIT_CPU покрыт
+(`rlimit_cpu_kills_spinning_child` — наблюдаемое signal-exit, не тайминг);
+enforcement cgroup (OOM-kill, троттлинг) тестами НЕ ассертится — контракт
+супервизора это размещение pid и значения файлов, а исполнение лимита — контракт
+ядра (тайминговые ассерты — источник флейков).
+
+**Известные ограничения Этапа 10 (осознанные):**
+
+1. Окно «exec → attach»: первые микросекунды процесс исполняется вне cgroup;
+   fork в этом окне остаётся вне cgroup навсегда (`clone3(CLONE_INTO_CGROUP)`
+   отклонён).
+2. cgroup не участвует в teardown: `cgroup.kill` не используется, сбежавший
+   орфан переживает остановку (как в Этапе 4) и, оставаясь в cgroup, мешает
+   `rmdir` (директория остаётся с debug-логом).
+3. `soft = hard` у rlimit-ов; поднять лимит выше hard-лимита самого супервизора
+   без привилегий нельзя — EPERM → штатный `SpawnError::Spawn` (видимая ошибка).
+4. cgroup требует v2, писабельного (делегированного) root'а и контроллеров,
+   включённых предком; иначе — ошибка спавна, не тихая деградация. На не-Linux —
+   тот же путь, компайл-таймовых веток нет.
+5. Enforcement cgroup-лимитов (OOM-kill, троттлинг) не ассертится тестами;
+   OOM-выход наблюдаем оператором как signal-exit → `Failure` → обычная
+   restart-policy (нового кода не требует).
+6. Демон, убитый SIGKILL, оставляет cgroup-директории (класс осиротевшего
+   state-файла); следующий старт переиспользует и перезаписывает лимиты.
+7. Контроллеры, дописанные в `cgroup.subtree_control`, обратно не выключаются.
+8. Лимиты не видны в `status`/state-файле; изменение секций через reload —
+   рестарт процесса.
+9. Один uid — один default root: два демона без явных `--cgroup-root` делят
+   `/sys/fs/cgroup/supervisor-rs`; коллизий директорий нет, пока уникальны имена
+   процессов (класс существующего ограничения дефолтных путей state/socket).
+10. `cpu-max-percent` с фиксированным period 100 ms; сырые quota/period не
+    экспортируются (кандидат POST_MVP).
+
+Тесты: юниты `src/config.rs` (парсинг/валидация обеих секций, пустая секция и
+нули отвергаются, пригодность имени как cgroup-директории), `src/limits.rs` (вся
+файловая механика на tempdir), `src/process.rs`
+(`spawn_with_rlimit_applies_limits_via_ulimit`, `rlimit_cpu_kills_spinning_child`,
+негативные cgroup-пути без привилегий); in-process `tests/limits.rs` (rlimit
+сохраняется через рестарт/reload, `cgroup_spawn_failure_is_per_process`, плюс
+гейтящиеся attach/respawn/stopped); e2e `tests/limits_e2e.rs`
+(`rlimit_applied_end_to_end`, `invalid_limits_section_fails_run_with_config_error`
+и гейтящийся `cgroup_end_to_end_created_attached_and_removed` — критерий приёмки
+целиком).
+
 ## Что вырезано из MVP
 
-cgroups/resource limits — вынесено в `docs/POST_MVP_PLAN.md` и в v1 не
-реализуется. Health-checks (exec/tcp/http, одна liveness-проба) реализованы в
-Этапе 7, ротация логов (захват + ротация по размеру) — в Этапе 9 — см. выше;
-триада startup/readiness/liveness, hostname/DNS, сжатие и ротация по времени
-остаются кандидатами в `docs/POST_MVP_PLAN.md`.
+cgroups/resource limits **реализованы в Этапе 10** (см. выше) — раздел
+`docs/POST_MVP_PLAN.md` помечен реализованным с оговоркой «`cgroup.kill`-teardown
+осознанно не сделан — решение пользователя». Health-checks (exec/tcp/http, одна
+liveness-проба) реализованы в Этапе 7, ротация логов (захват + ротация по
+размеру) — в Этапе 9; триада startup/readiness/liveness, hostname/DNS, сжатие и
+ротация по времени остаются кандидатами в `docs/POST_MVP_PLAN.md`.

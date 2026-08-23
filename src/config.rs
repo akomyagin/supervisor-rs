@@ -78,6 +78,21 @@ pub struct ProcessConfig {
     /// restart with no new branch.
     #[serde(default)]
     pub log: Option<LogConfig>,
+    /// Optional per-process rlimits (Этап 10), applied via setrlimit(2) in the
+    /// pre_exec hook next to `setsid()`, inherited by every descendant. A
+    /// `[process.rlimit]` subtable; without it limits are inherited from the
+    /// supervisor exactly as before. Derived `Clone`/`PartialEq` pick the field
+    /// up automatically, so the Этап 8 reload diff sees a changed rlimit section
+    /// as a config change and forces a restart with no new branch.
+    #[serde(default)]
+    pub rlimit: Option<RlimitConfig>,
+    /// Optional cgroup v2 limits for the whole supervised tree (Этап 10). A
+    /// `[process.cgroup]` subtable; without it no cgroup is touched. Kept last of
+    /// the subtables so the "scalars before subtables" TOML rule holds. Derived
+    /// `Clone`/`PartialEq` make the Этап 8 reload diff treat a changed section as
+    /// a config change (restart with new limits).
+    #[serde(default)]
+    pub cgroup: Option<CgroupConfig>,
 }
 
 fn default_stop_grace_secs() -> u64 {
@@ -350,6 +365,89 @@ impl LogConfig {
     }
 }
 
+// ---- Resource limits (Этап 10) ----
+//
+// Two opt-in per-process limit mechanisms, both the user's decisions and not to
+// be revisited (see docs/TECHNICAL_PLAN.md, Этап 10):
+//  1. `[process.rlimit]` — per-process setrlimit(2), applied in the existing
+//     pre_exec hook (soft = hard = value), inherited by every descendant.
+//  2. `[process.cgroup]` — cgroup v2 limits for the whole tree; the supervisor
+//     creates `<cgroup-root>/<name>`, writes the limit files and attaches the
+//     child right after spawn. A setup failure fails the spawn of this process
+//     (no silent "no limits" degradation). The cgroup is NOT used for teardown —
+//     killpg (Этап 4) remains the only stop mechanism.
+// Two separate sections, not one `[process.limits]`: the mechanisms differ on
+// every axis (scope, where applied, environment requirements, failure mode), so
+// a merged section would blur "which key goes where" and make the "at least one
+// key" validation ambiguous (health and log are separate sections for the same
+// reason).
+
+/// Raw, as-parsed `[process.rlimit]` section (Этап 10): per-process resource
+/// limits applied via setrlimit(2) in the pre_exec hook, soft = hard = value,
+/// inherited by every descendant. `Copy` on purpose: the pre_exec closure
+/// captures it by value, so applying limits allocates nothing in the forked
+/// child. Without privileges limits can only be lowered: a value above the
+/// supervisor's own hard limit fails the spawn with EPERM (a config/environment
+/// error made visible, not hidden). `Clone`+`PartialEq` keep the Этап 8 reload
+/// diff working.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct RlimitConfig {
+    /// RLIMIT_NOFILE: max open file descriptors.
+    #[serde(default)]
+    pub nofile: Option<NonZeroU64>,
+    /// RLIMIT_AS: max virtual address space, bytes.
+    #[serde(rename = "as-bytes", default)]
+    pub as_bytes: Option<NonZeroU64>,
+    /// RLIMIT_CPU: max CPU time, seconds (SIGXCPU at the soft limit).
+    #[serde(rename = "cpu-secs", default)]
+    pub cpu_secs: Option<NonZeroU64>,
+}
+
+impl RlimitConfig {
+    /// At least one of the three keys — an empty section is meaningless and
+    /// would mask a typo in a key name (the `LogConfig` precedent).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nofile.is_none() && self.as_bytes.is_none() && self.cpu_secs.is_none() {
+            return Err(
+                r#"rlimit section requires at least one of "nofile" / "as-bytes" / "cpu-secs""#
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Raw, as-parsed `[process.cgroup]` section (Этап 10): cgroup v2 limits for the
+/// whole supervised tree. The supervisor creates `<cgroup-root>/<name>`, writes
+/// the limit files and attaches the child right after spawn; a setup failure
+/// fails the spawn of this process (no silent "no limits" degradation). The
+/// cgroup is NOT used for teardown — killpg (Этап 4) remains the only stop
+/// mechanism, by the user's decision. `Clone`+`PartialEq` keep the Этап 8 reload
+/// diff working.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct CgroupConfig {
+    /// cpu.max as a percentage of one CPU (50 = half a CPU, 200 = two CPUs), over
+    /// a fixed 100 ms period. No upper bound: the kernel accepts any quota.
+    #[serde(rename = "cpu-max-percent", default)]
+    pub cpu_max_percent: Option<NonZeroU32>,
+    /// memory.max, bytes.
+    #[serde(rename = "memory-max-bytes", default)]
+    pub memory_max_bytes: Option<NonZeroU64>,
+}
+
+impl CgroupConfig {
+    /// At least one of the two keys, same rationale as `RlimitConfig`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cpu_max_percent.is_none() && self.memory_max_bytes.is_none() {
+            return Err(
+                r#"cgroup section requires at least one of "cpu-max-percent" / "memory-max-bytes""#
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io {
@@ -363,8 +461,12 @@ pub enum ConfigError {
     /// A syntactically valid config that fails a semantic, cross-field or
     /// cross-process check: a health-check section that fails cross-field
     /// validation (Этап 7), a process name that is not unique (Этап 8, the
-    /// by-name reload diff needs a unique key), or a log section that names no
-    /// path, self-collides, or duplicates another process's log path (Этап 9).
+    /// by-name reload diff needs a unique key), a log section that names no
+    /// path, self-collides, or duplicates another process's log path (Этап 9),
+    /// an empty `[process.rlimit]` / `[process.cgroup]` section, or a process
+    /// name unusable as a cgroup directory name when it carries a
+    /// `[process.cgroup]` section (Этап 10, e.g.
+    /// `process name "a/b" is not usable as a cgroup directory name`).
     /// Reported at load time with exit 1, the existing "config error" class —
     /// no new exit code.
     Invalid {
@@ -474,6 +576,47 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                         message: format!("duplicate log path \"{}\"", candidate.display()),
                     });
                 }
+            }
+        }
+    }
+    // Cross-field validation of each rlimit / cgroup section (Этап 10): an empty
+    // section (no key set) is caught here, at load time, with the process name —
+    // never a runtime panic. The `NonZero*` field types already reject zeros at
+    // parse time.
+    for proc in &config.process {
+        if let Some(rl) = &proc.rlimit {
+            if let Err(message) = rl.validate() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("process \"{}\": {message}", proc.name),
+                });
+            }
+        }
+        if let Some(cg) = &proc.cgroup {
+            if let Err(message) = cg.validate() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("process \"{}\": {message}", proc.name),
+                });
+            }
+            // A cgroup section makes `<cgroup-root>/<name>` a real directory
+            // path, so the process name must be usable as a single path
+            // component. This tightening applies only to processes with a cgroup
+            // section (others are untouched). A name with `/` or NUL, or `.` /
+            // `..`, or empty, cannot be a directory name.
+            let name = proc.name.as_str();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\0')
+            {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "process name \"{name}\" is not usable as a cgroup directory name"
+                    ),
+                });
             }
         }
     }
@@ -1018,6 +1161,8 @@ command = ["/usr/bin/env", "false"]
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             health_check: None,
             log: None,
+            rlimit: None,
+            cgroup: None,
         };
         assert_eq!(base, base.clone());
 
@@ -1075,6 +1220,30 @@ command = ["/usr/bin/env", "false"]
         let mut with_log_b = base.clone();
         with_log_b.log = Some(log_b);
         assert_ne!(with_log, with_log_b);
+
+        // Rlimit section: None -> Some, and Some -> Some with a different
+        // `nofile` must both break equality (Этап 10).
+        let rl_a: RlimitConfig = toml::from_str("nofile = 1024").unwrap();
+        let mut with_rl = base.clone();
+        with_rl.rlimit = Some(rl_a);
+        assert_ne!(base, with_rl);
+
+        let rl_b: RlimitConfig = toml::from_str("nofile = 2048").unwrap();
+        let mut with_rl_b = base.clone();
+        with_rl_b.rlimit = Some(rl_b);
+        assert_ne!(with_rl, with_rl_b);
+
+        // Cgroup section: None -> Some, and Some -> Some with a different
+        // `memory-max-bytes` must both break equality (Этап 10).
+        let cg_a: CgroupConfig = toml::from_str("memory-max-bytes = 1048576").unwrap();
+        let mut with_cg = base.clone();
+        with_cg.cgroup = Some(cg_a);
+        assert_ne!(base, with_cg);
+
+        let cg_b: CgroupConfig = toml::from_str("memory-max-bytes = 2097152").unwrap();
+        let mut with_cg_b = base.clone();
+        with_cg_b.cgroup = Some(cg_b);
+        assert_ne!(with_cg, with_cg_b);
     }
 
     // ---- Log rotation (Этап 9) ----
@@ -1249,5 +1418,224 @@ stderr-path = "/var/log/shared.log"
         "#;
         let config: Config = toml::from_str(toml_src).unwrap();
         assert!(config.process[0].log.is_none());
+    }
+
+    // ---- Resource limits (Этап 10) ----
+
+    #[test]
+    fn parses_rlimit_section_full() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.rlimit]
+            nofile = 1024
+            as-bytes = 536870912
+            cpu-secs = 300
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let rl = config.process[0].rlimit.as_ref().unwrap();
+        assert_eq!(rl.nofile.unwrap().get(), 1024);
+        assert_eq!(rl.as_bytes.unwrap().get(), 536870912);
+        assert_eq!(rl.cpu_secs.unwrap().get(), 300);
+        rl.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_rlimit_with_single_key() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.rlimit]
+            nofile = 256
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let rl = config.process[0].rlimit.as_ref().unwrap();
+        assert_eq!(rl.nofile.unwrap().get(), 256);
+        assert!(rl.as_bytes.is_none());
+        assert!(rl.cpu_secs.is_none());
+        rl.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_cgroup_section_full() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.cgroup]
+            cpu-max-percent = 50
+            memory-max-bytes = 268435456
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let cg = config.process[0].cgroup.as_ref().unwrap();
+        assert_eq!(cg.cpu_max_percent.unwrap().get(), 50);
+        assert_eq!(cg.memory_max_bytes.unwrap().get(), 268435456);
+        cg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_cgroup_with_only_memory() {
+        let toml_src = r#"
+            [[process]]
+            name = "web"
+            command = ["/usr/bin/env", "true"]
+
+            [process.cgroup]
+            memory-max-bytes = 1048576
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        let cg = config.process[0].cgroup.as_ref().unwrap();
+        assert!(cg.cpu_max_percent.is_none());
+        assert_eq!(cg.memory_max_bytes.unwrap().get(), 1048576);
+        cg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_rlimit_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.rlimit]
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"process "web""#), "{text}");
+        assert!(text.contains("nofile"), "{text}");
+        assert!(text.contains("as-bytes"), "{text}");
+        assert!(text.contains("cpu-secs"), "{text}");
+    }
+
+    #[test]
+    fn rejects_empty_cgroup_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+[[process]]
+name = "web"
+command = ["/usr/bin/env", "true"]
+
+[process.cgroup]
+"#,
+        )
+        .unwrap();
+        let err = load(file.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains(r#"process "web""#), "{text}");
+        assert!(text.contains("cpu-max-percent"), "{text}");
+        assert!(text.contains("memory-max-bytes"), "{text}");
+    }
+
+    #[test]
+    fn rejects_zero_limit_values() {
+        for field in [
+            ("rlimit", "nofile = 0"),
+            ("rlimit", "as-bytes = 0"),
+            ("rlimit", "cpu-secs = 0"),
+            ("cgroup", "cpu-max-percent = 0"),
+            ("cgroup", "memory-max-bytes = 0"),
+        ] {
+            let (section, kv) = field;
+            let toml_src = format!(
+                r#"
+                [[process]]
+                name = "web"
+                command = ["/usr/bin/env", "true"]
+
+                [process.{section}]
+                {kv}
+                "#,
+            );
+            assert!(
+                toml::from_str::<Config>(&toml_src).is_err(),
+                "zero must be rejected for: {kv}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_snake_case_limit_keys() {
+        // snake_case keys are silently ignored by the parser, so the section
+        // becomes empty and `load()` rejects it — pins the kebab-case contract.
+        for (section, kv) in [
+            ("rlimit", "as_bytes = 1024"),
+            ("cgroup", "cpu_max_percent = 50"),
+        ] {
+            let mut file = NamedTempFile::new().unwrap();
+            let body = format!(
+                "\n[[process]]\nname = \"web\"\ncommand = [\"/usr/bin/env\", \"true\"]\n\n[process.{section}]\n{kv}\n"
+            );
+            file.write_all(body.as_bytes()).unwrap();
+            let err = load(file.path()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "snake_case key must leave the section empty and be rejected: {kv}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cgroup_process_name_unfit_for_directory() {
+        for bad in ["a/b", ".."] {
+            let toml_src = format!(
+                r#"
+                [[process]]
+                name = "{bad}"
+                command = ["/usr/bin/env", "true"]
+
+                [process.cgroup]
+                memory-max-bytes = 1048576
+                "#,
+            );
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(toml_src.as_bytes()).unwrap();
+            let err = load(file.path()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "name {bad:?} with a cgroup section must be rejected"
+            );
+            let text = err.to_string();
+            assert!(text.contains("cgroup directory name"), "{text}");
+
+            // The same name WITHOUT a cgroup section is fine (tightening is
+            // pointed, not global).
+            let ok_src = format!(
+                r#"
+                [[process]]
+                name = "{bad}"
+                command = ["/usr/bin/env", "true"]
+                "#,
+            );
+            let mut ok_file = NamedTempFile::new().unwrap();
+            ok_file.write_all(ok_src.as_bytes()).unwrap();
+            assert!(
+                load(ok_file.path()).is_ok(),
+                "name {bad:?} without a cgroup section must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn process_without_limit_sections_parses() {
+        let toml_src = r#"
+            [[process]]
+            name = "bare"
+            command = ["/usr/bin/env", "true"]
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert!(config.process[0].rlimit.is_none());
+        assert!(config.process[0].cgroup.is_none());
     }
 }

@@ -6,12 +6,14 @@
 //! direct child alone.
 
 use crate::config::ProcessConfig;
+use crate::limits;
 use nix::errno::Errno;
 use nix::sys::signal::{killpg, Signal};
 use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 /// A freshly spawned process together with the supervisor-side read ends of its
@@ -23,6 +25,10 @@ pub struct Spawned {
     pub child: Child,
     pub stdout_capture: Option<OwnedFd>,
     pub stderr_capture: Option<OwnedFd>,
+    /// The created cgroup of this instance (Этап 10); `Some` exactly when the
+    /// config has a `[process.cgroup]` section. Owning handle: dropping it
+    /// best-effort-removes the directory.
+    pub cgroup: Option<limits::ProcessCgroup>,
 }
 
 #[derive(Debug)]
@@ -38,6 +44,19 @@ pub enum SpawnError {
     CapturePipe {
         name: String,
         source: nix::errno::Errno,
+    },
+    /// Этап 10: creating/configuring the process's cgroup failed before spawn
+    /// (nothing was spawned). Covers a `[process.cgroup]` section with no cgroup
+    /// root configured, too.
+    CgroupSetup {
+        name: String,
+        source: std::io::Error,
+    },
+    /// Этап 10: the child spawned but could not be attached to its cgroup; it has
+    /// been SIGKILLed and reaped before this error was returned.
+    CgroupAttach {
+        name: String,
+        source: std::io::Error,
     },
 }
 
@@ -56,6 +75,12 @@ impl std::fmt::Display for SpawnError {
                     "process '{name}': failed to create capture pipe: {source}"
                 )
             }
+            SpawnError::CgroupSetup { name, source } => {
+                write!(f, "process '{name}': failed to set up cgroup: {source}")
+            }
+            SpawnError::CgroupAttach { name, source } => {
+                write!(f, "process '{name}': failed to attach to cgroup: {source}")
+            }
         }
     }
 }
@@ -66,16 +91,49 @@ impl std::error::Error for SpawnError {
             SpawnError::EmptyCommand { .. } => None,
             SpawnError::Spawn { source, .. } => Some(source),
             SpawnError::CapturePipe { source, .. } => Some(source),
+            SpawnError::CgroupSetup { source, .. } => Some(source),
+            SpawnError::CgroupAttach { source, .. } => Some(source),
         }
     }
 }
 
-pub fn spawn(cfg: &ProcessConfig) -> Result<Spawned, SpawnError> {
+/// `cgroup_root`: where to create the per-process cgroup if the config has a
+/// `[process.cgroup]` section. `None` with such a section is an error (the config
+/// demands isolation the runtime cannot provide) — main.rs always resolves a
+/// root, so this only guards hand-built test configs.
+pub fn spawn(cfg: &ProcessConfig, cgroup_root: Option<&Path>) -> Result<Spawned, SpawnError> {
     if cfg.command.is_empty() {
         return Err(SpawnError::EmptyCommand {
             name: cfg.name.clone(),
         });
     }
+
+    // cgroup setup — before anything else (Этап 10, plan §2 p.4): the directory
+    // and limit files must be ready before the fork so the child can be attached
+    // the instant it exists. A failure here returns before a single pipe or
+    // process is created — the process does not start (no silent "no limits"
+    // degradation). A `[process.cgroup]` section with no root configured is the
+    // same failure class.
+    let cgroup = match (&cfg.cgroup, cgroup_root) {
+        (Some(cc), Some(root)) => {
+            Some(
+                limits::setup(root, &cfg.name, cc).map_err(|source| SpawnError::CgroupSetup {
+                    name: cfg.name.clone(),
+                    source,
+                })?,
+            )
+        }
+        (Some(_), None) => {
+            return Err(SpawnError::CgroupSetup {
+                name: cfg.name.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no cgroup root configured for a process with a [process.cgroup] section",
+                ),
+            });
+        }
+        (None, _) => None,
+    };
 
     let mut cmd = Command::new(&cfg.command[0]);
     cmd.args(&cfg.command[1..]);
@@ -143,14 +201,37 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Spawned, SpawnError> {
     // honest. Cost: supervised children have no controlling terminal, the same
     // trade systemd makes.
     //
+    // Capture the rlimit config by value: `RlimitConfig` is `Copy` (Этап 10), so
+    // the closure owns plain integers and the hook still allocates nothing — the
+    // invariant that keeps it fork-safe alongside the Этап 9 reader threads.
+    let rlimit = cfg.rlimit;
+
     // SAFETY: pre_exec runs in the forked child between fork and exec, where
-    // only async-signal-safe calls are allowed. setsid() qualifies: a single
-    // syscall, no allocation, no locks.
+    // only async-signal-safe calls are allowed. setsid() and setrlimit() both
+    // qualify: single syscalls, no allocation, no locks — the invariant that
+    // keeps this hook safe alongside the Этап 9 reader threads of the parent.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             nix::unistd::setsid()
                 .map(|_| ())
-                .map_err(std::io::Error::from)
+                .map_err(std::io::Error::from)?;
+            if let Some(rl) = rlimit {
+                use nix::sys::resource::{setrlimit, Resource};
+                for (resource, value) in [
+                    (Resource::RLIMIT_NOFILE, rl.nofile),
+                    (Resource::RLIMIT_AS, rl.as_bytes),
+                    (Resource::RLIMIT_CPU, rl.cpu_secs),
+                ] {
+                    if let Some(v) = value {
+                        // soft = hard = v (plan §2.1); raising a limit above the
+                        // supervisor's own hard limit fails with EPERM, which
+                        // surfaces as a loud SpawnError::Spawn — never a silent
+                        // "no limit applied".
+                        setrlimit(resource, v.get(), v.get()).map_err(std::io::Error::from)?;
+                    }
+                }
+            }
+            Ok(())
         });
     }
 
@@ -158,10 +239,40 @@ pub fn spawn(cfg: &ProcessConfig) -> Result<Spawned, SpawnError> {
         name: cfg.name.clone(),
         source,
     })?;
+
+    // attach — right after spawn, from the PARENT (Этап 10, plan §2 p.4):
+    // formatting a pid allocates, which is banned in the forked child while the
+    // Этап 9 reader threads exist. On failure the already-spawned child is
+    // SIGKILLed by pid and reaped (the exec-probe precedent of Этап 7 — a KILLed
+    // process still holds a slot until waited on), then the error is returned so
+    // the cgroup handle is dropped and its now-empty directory removed.
+    //
+    // `child.kill()` (SIGKILL by pid), NOT signal_group: the child's `setsid`
+    // may not have run yet, so its pgid may not exist. A grandchild forked in
+    // this sub-millisecond window would be orphaned — a corner of the error path,
+    // the same class as the "signal before setsid" window of signal_group.
+    //
+    // Window "exec → attach": the process runs outside the cgroup for a few
+    // microseconds before its pid is written; a fork made in that window stays
+    // outside the cgroup forever. Known limitation (plan §12); the atomic
+    // alternative clone3(CLONE_INTO_CGROUP) is rejected (plan §2 p.4).
+    if let Some(cg) = &cgroup {
+        if let Err(source) = cg.attach(child.id()) {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SpawnError::CgroupAttach {
+                name: cfg.name.clone(),
+                source,
+            });
+        }
+    }
+
     Ok(Spawned {
         child,
         stdout_capture,
         stderr_capture,
+        cgroup,
     })
 }
 
@@ -239,6 +350,8 @@ mod tests {
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             health_check: None,
             log: None,
+            rlimit: None,
+            cgroup: None,
         }
     }
 
@@ -266,7 +379,7 @@ mod tests {
     #[test]
     fn spawn_rejects_empty_command() {
         let cfg = cfg("empty", &[]);
-        let err = spawn(&cfg).unwrap_err();
+        let err = spawn(&cfg, None).unwrap_err();
         assert!(matches!(err, SpawnError::EmptyCommand { .. }));
     }
 
@@ -275,7 +388,7 @@ mod tests {
     #[test]
     fn spawned_child_leads_own_process_group() {
         let cfg = cfg("group", &["/usr/bin/env", "sleep", "60"]);
-        let mut child = spawn(&cfg).unwrap().child;
+        let mut child = spawn(&cfg, None).unwrap().child;
         let pid = Pid::from_raw(child.id() as i32);
 
         // setsid happens in the child after fork, so poll rather than assume it
@@ -298,7 +411,7 @@ mod tests {
     #[test]
     fn peek_exited_does_not_reap() {
         let cfg = cfg("quick", &["/usr/bin/env", "sh", "-c", "exit 0"]);
-        let mut child = spawn(&cfg).unwrap().child;
+        let mut child = spawn(&cfg, None).unwrap().child;
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !peek_exited(&child).unwrap() {
@@ -319,7 +432,7 @@ mod tests {
     #[test]
     fn spawn_without_log_inherits_stdio() {
         let cfg = cfg("plain", &["/usr/bin/env", "sh", "-c", "exit 0"]);
-        let mut spawned = spawn(&cfg).unwrap();
+        let mut spawned = spawn(&cfg, None).unwrap();
         assert!(spawned.stdout_capture.is_none());
         assert!(spawned.stderr_capture.is_none());
         spawned.child.wait().unwrap();
@@ -341,7 +454,7 @@ mod tests {
             Some("/tmp/unused-stdout.log"),
             None,
         );
-        let mut spawned = spawn(&cfg).unwrap();
+        let mut spawned = spawn(&cfg, None).unwrap();
         let fd = spawned.stdout_capture.take().expect("stdout captured");
         let mut pipe = std::fs::File::from(fd);
         let mut buf = Vec::new();
@@ -362,7 +475,7 @@ mod tests {
             None,
             Some("/tmp/unused-stderr.log"),
         );
-        let mut spawned = spawn(&cfg).unwrap();
+        let mut spawned = spawn(&cfg, None).unwrap();
         assert!(spawned.stdout_capture.is_none());
         let fd = spawned.stderr_capture.take().expect("stderr captured");
         let mut pipe = std::fs::File::from(fd);
@@ -370,5 +483,129 @@ mod tests {
         pipe.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"err\n");
         spawned.child.wait().unwrap();
+    }
+
+    // ---- Resource limits (Этап 10) ----
+
+    /// Attaches a `[process.rlimit]` section to a config via `toml::from_str`
+    /// (the `cfg_with_log` precedent for building an optional section).
+    fn cfg_with_rlimit(name: &str, command: &[&str], rlimit_toml: &str) -> ProcessConfig {
+        let mut c = cfg(name, command);
+        c.rlimit = Some(toml::from_str(rlimit_toml).expect("valid rlimit section"));
+        c
+    }
+
+    /// Polls a marker file until it holds a complete, parseable line satisfying
+    /// `pred`, then returns its trimmed contents. The stub writes it from another
+    /// process, asynchronously, so polling on content (not existence) is the only
+    /// correct wait — real OS time, unrelated to any Clock.
+    fn wait_for_marker(path: &std::path::Path, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let line = text.trim();
+                if !line.is_empty() {
+                    return line.to_string();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("marker not written within {timeout:?}");
+    }
+
+    /// The rlimit observation trick: the stub reads its own limits via the
+    /// `ulimit` shell builtin and writes them to a marker. `ulimit -n` prints the
+    /// soft NOFILE, `ulimit -v` the address space in KiB, `ulimit -t` CPU seconds.
+    /// Deterministic, unprivileged, no dying process. as-bytes is 512 MiB so
+    /// `ulimit -v` reports 524288 KiB.
+    #[test]
+    fn spawn_with_rlimit_applies_limits_via_ulimit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("limits.txt");
+        let script = format!(
+            r#"echo "$(ulimit -n) $(ulimit -v) $(ulimit -t)" > "{}""#,
+            marker.display()
+        );
+        let cfg = cfg_with_rlimit(
+            "limited",
+            &["/usr/bin/env", "sh", "-c", &script],
+            "nofile = 123\nas-bytes = 536870912\ncpu-secs = 111\n",
+        );
+        let mut spawned = spawn(&cfg, None).unwrap();
+        let line = wait_for_marker(&marker, Duration::from_secs(10));
+        assert_eq!(line, "123 524288 111", "ulimit output: {line:?}");
+        spawned.child.wait().unwrap();
+    }
+
+    /// Without a rlimit section the child inherits the supervisor's own soft
+    /// NOFILE — not the 123 of the previous test.
+    #[test]
+    fn spawn_without_rlimit_leaves_limits_inherited() {
+        use nix::sys::resource::{getrlimit, Resource};
+        let (soft, _hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("nofile.txt");
+        let script = format!(r#"ulimit -n > "{}""#, marker.display());
+        let cfg = cfg("plain", &["/usr/bin/env", "sh", "-c", &script]);
+        let mut spawned = spawn(&cfg, None).unwrap();
+        let line = wait_for_marker(&marker, Duration::from_secs(10));
+        assert_eq!(line, soft.to_string(), "inherited NOFILE mismatch");
+        assert_ne!(line, "123");
+        spawned.child.wait().unwrap();
+    }
+
+    /// RLIMIT_CPU enforcement: a spinning child with `cpu-secs = 1` is killed by
+    /// the kernel (SIGXCPU, or SIGKILL if the kernel escalates) — assert
+    /// "signaled", not a specific signal number. The only real-time test of the
+    /// stage (~1 s of CPU), the same class as the shutdown tests.
+    #[test]
+    fn rlimit_cpu_kills_spinning_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let cfg = cfg_with_rlimit(
+            "spinner",
+            &["/usr/bin/env", "sh", "-c", "while :; do :; done"],
+            "cpu-secs = 1\n",
+        );
+        let mut spawned = spawn(&cfg, None).unwrap();
+        // Bounded real-time wait; the kernel delivers SIGXCPU within ~1 CPU sec.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = spawned.child.try_wait().unwrap() {
+                assert!(
+                    status.signal().is_some(),
+                    "spinning child was not killed by a signal: {status:?}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "spinning child not killed within the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A `[process.cgroup]` section with no cgroup root is a `CgroupSetup` error;
+    /// nothing is spawned.
+    #[test]
+    fn spawn_with_cgroup_without_root_is_an_error() {
+        let mut cfg = cfg("cg", &["/usr/bin/env", "true"]);
+        cfg.cgroup = Some(toml::from_str("memory-max-bytes = 1048576").unwrap());
+        let err = spawn(&cfg, None).unwrap_err();
+        assert!(matches!(err, SpawnError::CgroupSetup { .. }), "{err:?}");
+    }
+
+    /// A cgroup root pointing *inside* a regular file yields ENOTDIR from
+    /// `create_dir_all` → `CgroupSetup`, before any fork. Exercises the negative
+    /// path without privileges and without the gate.
+    #[test]
+    fn spawn_with_unwritable_cgroup_root_fails_before_fork() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // A path *under* a regular file cannot be a directory.
+        let bad_root = file.path().join("sub");
+        let mut cfg = cfg("cg", &["/usr/bin/env", "true"]);
+        cfg.cgroup = Some(toml::from_str("memory-max-bytes = 1048576").unwrap());
+        let err = spawn(&cfg, Some(&bad_root)).unwrap_err();
+        assert!(matches!(err, SpawnError::CgroupSetup { .. }), "{err:?}");
     }
 }

@@ -73,3 +73,29 @@ restart = "always"
 # stderr-path = "/var/log/worker.stderr.log"   # separate files; both optional
 # max-size-bytes = 10485760                     # default 10 MiB (10 * 1024 * 1024)
 # keep = 5                                       # default 5; rotated .1 (newest) … .keep
+
+# Optional per-process resource limits via setrlimit(2) (Этап 10). Applied in the
+# pre_exec hook (soft = hard = value) and inherited by every descendant. Without
+# privileges limits can only be *lowered*: a value above the supervisor's own
+# hard limit fails the spawn (EPERM). At least one key is required. Uncomment to
+# try it:
+#
+# [process.rlimit]
+# nofile = 1024               # RLIMIT_NOFILE: max open file descriptors
+# as-bytes = 536870912        # RLIMIT_AS: max virtual address space, bytes
+# cpu-secs = 300              # RLIMIT_CPU: max CPU seconds (SIGXCPU at the limit)
+
+# Optional cgroup v2 limits for this process's whole tree (Этап 10). The
+# supervisor creates <cgroup-root>/<name>, writes cpu.max / memory.max, and after
+# spawn writes the child's pid into cgroup.procs — the limit then covers every
+# descendant. The cgroup is used ONLY for CPU/memory limits, never for teardown
+# (killpg remains the sole stop mechanism). Requires a delegated, writable cgroup
+# v2 subtree: the cgroup-root's ancestor must have enabled the cpu/memory
+# controllers in its cgroup.subtree_control. The root defaults to
+# /sys/fs/cgroup/supervisor-rs and is overridable with `run --cgroup-root <path>`.
+# A setup failure fails the spawn of THIS process (no silent "no limits"), leaving
+# its neighbours running. At least one key is required. Uncomment to try it:
+#
+# [process.cgroup]
+# cpu-max-percent = 50        # cpu.max as % of one CPU (50 = half, 200 = two CPUs)
+# memory-max-bytes = 268435456 # memory.max, bytes (256 MiB)
